@@ -11,21 +11,20 @@ uiautomation is shared under the Apache Licene 2.0.
 This means that the code can be freely copied and distributed, and costs nothing to use.
 """
 
+import math
 import os
 import sys
 import time
-import datetime
 import shlex
 import struct
-import atexit
 import threading
 import ctypes
 import ctypes.wintypes
+from dataclasses import dataclass
 import comtypes
 import comtypes.client
 from _ctypes import COMError
-from io import TextIOWrapper
-from typing import Any, Callable, Dict, Generator, List, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Mapping, Tuple
 
 
 METRO_WINDOW_CLASS_NAME = "Windows.UI.Core.CoreWindow"  # for Windows 8 and 8.1
@@ -45,8 +44,30 @@ ProcessTime = time.perf_counter  # this returns nearly 0 when first call it if p
 ProcessTime()  # need to call it once if python version <= 3.6
 TreeNode = Any
 from .enums import *  # noqa: E402
-from .enums import _INPUTUnion
-from .exceptions import from_com_error, UIAException  # noqa: E402
+from .enums import _INPUTUnion  # noqa: E402
+from .exceptions import from_com_error  # noqa: E402
+from .comtypes_cache import safe_get_module  # noqa: E402
+
+
+DEFAULT_UIA_CONNECTION_TIMEOUT_MS = 2000
+DEFAULT_UIA_TRANSACTION_TIMEOUT_MS = 5000
+
+
+def _uia_timeout_ms(name: str, default: int, env: Mapping[str, str] | None = None) -> int:
+    """Read a UI Automation client timeout (milliseconds) from the environment.
+
+    Args:
+        name: Environment variable to read.
+        default: Value used when the variable is unset, blank, not an integer, or below 1.
+        env: Mapping to read from. Defaults to ``os.environ``.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(name, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 1 else default
 
 
 class _AutomationClient:
@@ -67,11 +88,10 @@ class _AutomationClient:
         tryCount = 3
         for retry in range(tryCount):
             try:
-                self.UIAutomationCore = comtypes.client.GetModule("UIAutomationCore.dll")
-                self.IUIAutomation = comtypes.client.CreateObject(
-                    "{ff48dba4-60ef-4201-aa87-54103eef594e}",
-                    interface=self.UIAutomationCore.IUIAutomation,
+                self.UIAutomationCore = safe_get_module(
+                    "UIAutomationCore.dll", required_attr="IUIAutomation"
                 )
+                self.IUIAutomation = self._create_client()
                 self.ViewWalker = self.IUIAutomation.RawViewWalker
                 # self.ViewWalker = self.IUIAutomation.ControlViewWalker
                 break
@@ -79,6 +99,32 @@ class _AutomationClient:
                 if retry + 1 == tryCount:
                     raise from_com_error(ex) from ex
                 time.sleep(0.1)
+
+    def _create_client(self):
+        """Create the shared client with bounded connection/transaction timeouts.
+
+        The v1 ``CUIAutomation`` coclass only implements ``IUIAutomation``, which has no
+        timeouts: a call into a window whose UI thread has stopped pumping messages blocks
+        until that window recovers. ``CUIAutomation8`` implements ``IUIAutomation2``, whose
+        ConnectionTimeout/TransactionTimeout make such a call fail with ERROR_TIMEOUT
+        instead. It is still a valid ``IUIAutomation``, so every existing caller keeps
+        working. Falls back to ``CUIAutomation`` where ``CUIAutomation8`` is unavailable.
+        """
+        core = self.UIAutomationCore
+        try:
+            client = comtypes.client.CreateObject(core.CUIAutomation8, interface=core.IUIAutomation2)
+            client.ConnectionTimeout = _uia_timeout_ms(
+                "WINDOWS_MCP_UIA_CONNECTION_TIMEOUT_MS", DEFAULT_UIA_CONNECTION_TIMEOUT_MS
+            )
+            client.TransactionTimeout = _uia_timeout_ms(
+                "WINDOWS_MCP_UIA_TRANSACTION_TIMEOUT_MS", DEFAULT_UIA_TRANSACTION_TIMEOUT_MS
+            )
+            return client
+        except (COMError, AttributeError, OSError):
+            return comtypes.client.CreateObject(
+                "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+                interface=core.IUIAutomation,
+            )
 
 
 # set Windows dll restype
@@ -217,6 +263,30 @@ def mouse_event(dwFlags: int, dx: int, dy: int, dwData: int, dwExtraInfo: int) -
     ctypes.windll.user32.mouse_event(dwFlags, dx, dy, dwData, dwExtraInfo)
 
 
+def AbsoluteMouseEvent(buttonFlag: int, x: int, y: int) -> None:
+    """
+    Emit a button mouse_event at the absolute screen point x, y.
+    buttonFlag: int, a button value in class `MouseEventFlag` (e.g. LeftDown).
+    x: int.
+    y: int.
+    Win32 only reads dx/dy when `MOUSEEVENTF_MOVE` is set, so a button event
+    sent with `MOUSEEVENTF_ABSOLUTE` alone is delivered wherever the cursor
+    already is and its coordinates are dead weight. `MOUSEEVENTF_VIRTUALDESK`
+    widens the normalized space from the primary monitor to the whole virtual
+    desktop, which is the space x and y are expressed in.
+    """
+    left, top, width, height = GetVirtualScreenRect()
+    nx = round((x - left) * 65535 / max(width - 1, 1))
+    ny = round((y - top) * 65535 / max(height - 1, 1))
+    mouse_event(
+        buttonFlag | MouseEventFlag.Move | MouseEventFlag.Absolute | MouseEventFlag.VirtualDesk,
+        nx,
+        ny,
+        0,
+        0,
+    )
+
+
 def keybd_event(bVk: int, bScan: int, dwFlags: int, dwExtraInfo: int) -> None:
     """keybd_event from Win32."""
     ctypes.windll.user32.keybd_event(bVk, bScan, dwFlags, dwExtraInfo)
@@ -259,22 +329,9 @@ def Click(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.LeftDown, x, y)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.LeftUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.LeftUp, x, y)
     time.sleep(waitTime)
 
 
@@ -286,22 +343,9 @@ def MiddleClick(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.MiddleDown, x, y)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.MiddleUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.MiddleUp, x, y)
     time.sleep(waitTime)
 
 
@@ -313,22 +357,9 @@ def RightClick(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.RightDown, x, y)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.RightUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.RightUp, x, y)
     time.sleep(waitTime)
 
 
@@ -340,14 +371,7 @@ def PressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.LeftDown, x, y)
     time.sleep(waitTime)
 
 
@@ -357,14 +381,7 @@ def ReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.LeftUp, x, y)
     time.sleep(waitTime)
 
 
@@ -376,14 +393,7 @@ def RightPressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> No
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.RightDown, x, y)
     time.sleep(waitTime)
 
 
@@ -393,14 +403,7 @@ def RightReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.RightUp, x, y)
     time.sleep(waitTime)
 
 
@@ -412,14 +415,7 @@ def MiddlePressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> N
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.MiddleDown, x, y)
     time.sleep(waitTime)
 
 
@@ -429,14 +425,7 @@ def MiddleReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    AbsoluteMouseEvent(MouseEventFlag.MiddleUp, x, y)
     time.sleep(waitTime)
 
 
@@ -480,6 +469,27 @@ def MoveTo(x: int, y: int, moveSpeed: float = 1, waitTime: float = OPERATION_WAI
     time.sleep(waitTime)
 
 
+def MoveToDuration(x: int, y: int, duration: float, waitTime: float = OPERATION_WAIT_TIME) -> None:
+    """
+    Simulate mouse move to point x, y over a bounded duration from current cursor.
+    """
+    curX, curY = GetCursorPos()
+    if duration <= 0:
+        SetCursorPos(x, y)
+        time.sleep(waitTime)
+        return
+
+    stepCount = max(2, min(200, math.ceil(duration / 0.01)))
+    interval = duration / stepCount
+    for i in range(1, stepCount + 1):
+        ratio = i / stepCount
+        cx = curX + round((x - curX) * ratio)
+        cy = curY + round((y - curY) * ratio)
+        SetCursorPos(cx, cy)
+        time.sleep(interval)
+    time.sleep(waitTime)
+
+
 def DragDrop(
     x1: int,
     y1: int,
@@ -487,6 +497,7 @@ def DragDrop(
     y2: int,
     moveSpeed: float = 1,
     waitTime: float = OPERATION_WAIT_TIME,
+    duration: float | None = None,
 ) -> None:
     """
     Simulate mouse left button drag from point x1, y1 drop to point x2, y2.
@@ -496,9 +507,20 @@ def DragDrop(
     y2: int.
     moveSpeed: float, 1 normal speed, < 1 move slower, > 1 move faster.
     waitTime: float.
+    duration: optional seconds for bounded intermediate movement.
     """
-    PressMouse(x1, y1, 0.05)
-    MoveTo(x2, y2, moveSpeed, 0.05)
+    try:
+        PressMouse(x1, y1, 0.05)
+        if duration is None:
+            MoveTo(x2, y2, moveSpeed, 0.05)
+        else:
+            MoveToDuration(x2, y2, duration, 0.05)
+    except BaseException as move_error:
+        try:
+            ReleaseMouse(waitTime)
+        except BaseException as release_error:
+            raise release_error from move_error
+        raise
     ReleaseMouse(waitTime)
 
 
@@ -643,19 +665,154 @@ def GetVirtualScreenRect() -> Tuple[int, int, int, int]:
     )
 
 
-def GetMonitorsRect() -> List[Rect]:
+@dataclass(frozen=True)
+class DisplayInfo:
+    """Display identity and geometry from the Windows monitor APIs."""
+
+    index: int
+    device_name: str
+    rect: "Rect"
+    primary: bool
+    work_rect: "Rect | None" = None
+    effective_dpi: int | None = None
+    scale: float | None = None
+    orientation: str | None = None
+
+
+class _MonitorInfoExW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szDevice", ctypes.wintypes.WCHAR * 32),
+    ]
+
+
+class _DisplayDeviceW(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.wintypes.DWORD),
+        ("DeviceName", ctypes.wintypes.WCHAR * 32),
+        ("DeviceString", ctypes.wintypes.WCHAR * 128),
+        ("StateFlags", ctypes.wintypes.DWORD),
+        ("DeviceID", ctypes.wintypes.WCHAR * 128),
+        ("DeviceKey", ctypes.wintypes.WCHAR * 128),
+    ]
+
+
+def _get_system_dpi() -> int | None:
+    try:
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        if dpi > 0:
+            return dpi
+    except Exception:
+        pass
+
+    hdc = None
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        if hdc:
+            dpi = int(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+            if dpi > 0:
+                return dpi
+    except Exception:
+        pass
+    finally:
+        if hdc:
+            try:
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+            except Exception:
+                pass
+    return None
+
+
+def _dpi_metadata(dpi: int | None) -> tuple[int | None, float | None]:
+    if dpi is None:
+        return None, None
+    return dpi, round(dpi / 96, 6)
+
+
+def _get_monitor_effective_dpi(h_monitor: int) -> tuple[int | None, float | None]:
+    try:
+        dpi_x = ctypes.c_uint()
+        dpi_y = ctypes.c_uint()
+        result = ctypes.windll.shcore.GetDpiForMonitor(
+            ctypes.c_void_p(h_monitor),
+            0,
+            ctypes.byref(dpi_x),
+            ctypes.byref(dpi_y),
+        )
+        if result == 0 and dpi_x.value > 0:
+            return _dpi_metadata(int(dpi_x.value))
+    except Exception:
+        pass
+    return _dpi_metadata(_get_system_dpi())
+
+
+def _get_display_orientation(device_name: str, rect: "Rect") -> str:
+    dev_mode_size = 220
+    dm_size_offset = 68
+    dm_pels_width_offset = 172
+    dm_pels_height_offset = 176
+    dev_mode = bytearray(dev_mode_size)
+    dev_mode[dm_size_offset : dm_size_offset + 2] = struct.pack("<H", dev_mode_size)
+    c_dev_mode = (ctypes.c_byte * dev_mode_size).from_buffer(dev_mode)
+    try:
+        if ctypes.windll.user32.EnumDisplaySettingsW(
+            device_name,
+            ctypes.wintypes.DWORD(-1),
+            c_dev_mode,
+        ):
+            width = struct.unpack_from("<I", dev_mode, dm_pels_width_offset)[0]
+            height = struct.unpack_from("<I", dev_mode, dm_pels_height_offset)[0]
+            if width > 0 and height > 0:
+                return "landscape" if width >= height else "portrait"
+    except Exception:
+        pass
+    return "landscape" if rect.width() >= rect.height() else "portrait"
+
+
+def _active_display_indices() -> Dict[str, int]:
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
+    display_indices: dict[str, int] = {}
+    device_index = 0
+    while True:
+        device = _DisplayDeviceW()
+        device.cb = ctypes.sizeof(_DisplayDeviceW)
+        if not ctypes.windll.user32.EnumDisplayDevicesW(
+            None,
+            device_index,
+            ctypes.byref(device),
+            0,
+        ):
+            break
+        if device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
+            display_indices[device.DeviceName.upper()] = len(display_indices)
+        device_index += 1
+    return display_indices
+
+
+def GetDisplays() -> List[DisplayInfo]:
     """
-    Get monitors' rect.
-    Return List[Rect].
+    Get active displays keyed by zero-based active display index.
+    Return List[DisplayInfo].
     """
     MonitorEnumProc = ctypes.WINFUNCTYPE(
         ctypes.c_int,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
         ctypes.POINTER(ctypes.wintypes.RECT),
         ctypes.c_size_t,
     )
-    rects = []
+    displays: list[DisplayInfo] = []
+    display_indices = _active_display_indices()
+
+    def next_fallback_index() -> int:
+        used_indices = set(display_indices.values()) | {display.index for display in displays}
+        index = 0
+        while index in used_indices:
+            index += 1
+        return index
 
     def MonitorCallback(
         hMonitor: int,
@@ -663,19 +820,64 @@ def GetMonitorsRect() -> List[Rect]:
         lprcMonitor: ctypes.POINTER(ctypes.wintypes.RECT),
         dwData: int,
     ):
-        rect = Rect(
-            lprcMonitor.contents.left,
-            lprcMonitor.contents.top,
-            lprcMonitor.contents.right,
-            lprcMonitor.contents.bottom,
+        info = _MonitorInfoExW()
+        info.cbSize = ctypes.sizeof(_MonitorInfoExW)
+        if ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(hMonitor), ctypes.byref(info)):
+            rect = Rect(
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                info.rcMonitor.right,
+                info.rcMonitor.bottom,
+            )
+            work_rect = Rect(
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            )
+            device_name = info.szDevice
+            index = display_indices.get(device_name.upper(), next_fallback_index())
+            primary = bool(info.dwFlags & 1)
+        else:
+            rect = Rect(
+                lprcMonitor.contents.left,
+                lprcMonitor.contents.top,
+                lprcMonitor.contents.right,
+                lprcMonitor.contents.bottom,
+            )
+            work_rect = None
+            index = next_fallback_index()
+            device_name = f"DISPLAY{index}"
+            primary = False
+        effective_dpi, scale = _get_monitor_effective_dpi(hMonitor)
+        orientation = _get_display_orientation(device_name, rect)
+
+        displays.append(
+            DisplayInfo(
+                index=index,
+                device_name=device_name,
+                rect=rect,
+                primary=primary,
+                work_rect=work_rect,
+                effective_dpi=effective_dpi,
+                scale=scale,
+                orientation=orientation,
+            )
         )
-        rects.append(rect)
         return 1
 
     ctypes.windll.user32.EnumDisplayMonitors(
         ctypes.c_void_p(0), ctypes.c_void_p(0), MonitorEnumProc(MonitorCallback), 0
     )
-    return rects
+    return sorted(displays, key=lambda display: display.index)
+
+
+def GetMonitorsRect() -> List[Rect]:
+    """
+    Get monitors' rect.
+    Return List[Rect].
+    """
+    return [display.rect for display in GetDisplays()]
 
 
 def GetPixelColor(x: int, y: int, handle: int = 0) -> int:
@@ -1237,6 +1439,22 @@ def SendUnicodeChar(char: str, charMode: bool = True) -> int:
     Return int, the number of events that it successfully inserted into the keyboard or mouse input stream.
                 If the function returns zero, the input was already blocked by another thread.
     """
+    if ord(char) > 0xFFFF:
+        # KEYBDINPUT.wScan is a 16-bit WORD, so a code point outside the BMP
+        # cannot ride in a single event — ord(char) would be truncated to its
+        # low 16 bits and type a private-use character instead. Windows
+        # recombines consecutive KEYEVENTF_UNICODE surrogate halves into the
+        # original character, so send one event pair per UTF-16 unit. There is
+        # no VkKeyScanW mapping for these, hence no charMode branch.
+        units = char.encode("utf-16-le")
+        ret = 0
+        for index in range(0, len(units), 2):
+            unit = int.from_bytes(units[index : index + 2], "little")
+            ret = SendInput(
+                KeyboardInput(0, unit, KeyboardEventFlag.KeyUnicode | KeyboardEventFlag.KeyDown),
+                KeyboardInput(0, unit, KeyboardEventFlag.KeyUnicode | KeyboardEventFlag.KeyUp),
+            )
+        return ret
     if charMode:
         vk = 0
         scan = ord(char)
@@ -1322,6 +1540,8 @@ def SendKeys(
     waitTime: float.
     charMode: bool, if False, the text typed is depend on the input method if a input method is on.
     debug: bool, if True, print the keys.
+    Unknown braced key names raise ValueError before any input is sent.
+    If sending is interrupted, release virtual keys pressed by this call.
     Examples:
     {Ctrl}, {Delete} ... are special keys' name in SpecialKeyNames.
     SendKeys('{Ctrl}a{Delete}{Ctrl}v{Ctrl}s{Ctrl}{Shift}s{Win}e{PageDown}') #press Ctrl+a, Delete, Ctrl+v, Ctrl+s, Ctrl+Shift+s, Win+e, PageDown
@@ -1335,6 +1555,10 @@ def SendKeys(
     SendKeys('`~!@#$%^&*()-_=+{Enter}')
     SendKeys('[]{{}{}}\\|;:\'\",<.>/?{Enter}')
     """
+    # The parser loop below indexes text[0] unconditionally, so an empty
+    # string would raise IndexError. There are no keys to type: do nothing.
+    if not text:
+        return
     holdKeys = (
         "WIN",
         "LWIN",
@@ -1376,6 +1600,8 @@ def SendKeys(
             if (len(key) == 2 and not key[1].isdigit()) or len(key) > 2:
                 raise ValueError('"{}" is not valid'.format(text[i : rindex + 1]))
             upperKey = key[0].upper()
+            if upperKey not in SpecialKeyNames and len(key[0]) != 1:
+                raise ValueError(f"Unknown key name: {key[0]!r}")
             count = 1
             if len(key) > 1:
                 count = int(key[1])
@@ -1522,47 +1748,55 @@ def SendKeys(
         if i >= length:
             break
     hotkeyInterval = 0.01
-    for i, key in enumerate(keys):
-        if key[1] == "UnicodeChar":
-            SendUnicodeChar(key[0], charMode)
-            time.sleep(interval)
-            if debug:
-                pass
-        else:
-            scanCode = _VKtoSC(key[0])
-            keybd_event(key[0], scanCode, key[1], 0)
-            if debug:
-                pass
-            if i + 1 == len(keys):
+    pressedKeys: dict[int, tuple[int, int]] = {}
+    try:
+        for i, key in enumerate(keys):
+            if key[1] == "UnicodeChar":
+                SendUnicodeChar(key[0], charMode)
                 time.sleep(interval)
                 if debug:
                     pass
             else:
+                scanCode = _VKtoSC(key[0])
+                if not key[1] & KeyboardEventFlag.KeyUp:
+                    # Record before injection: the call may raise after sending.
+                    pressedKeys[key[0]] = (scanCode, key[1] | KeyboardEventFlag.KeyUp)
+                keybd_event(key[0], scanCode, key[1], 0)
                 if key[1] & KeyboardEventFlag.KeyUp:
-                    if (
-                        keys[i + 1][1] == "UnicodeChar"
-                        or keys[i + 1][1] & KeyboardEventFlag.KeyUp == 0
-                    ):
-                        time.sleep(interval)
-                        if debug:
-                            pass
-                    else:
-                        time.sleep(
-                            hotkeyInterval
-                        )  # must sleep for a while, otherwise combined keys may not be caught
-                        if debug:
-                            pass
-                else:  # KeyboardEventFlag.KeyDown
-                    time.sleep(hotkeyInterval)
+                    pressedKeys.pop(key[0], None)
+                if debug:
+                    pass
+                if i + 1 == len(keys):
+                    time.sleep(interval)
                     if debug:
                         pass
-    # make sure hold keys are not pressed
-    # win = ctypes.windll.user32.GetAsyncKeyState(Keys.VK_LWIN)
-    # ctrl = ctypes.windll.user32.GetAsyncKeyState(Keys.VK_CONTROL)
-    # alt = ctypes.windll.user32.GetAsyncKeyState(Keys.VK_MENU)
-    # shift = ctypes.windll.user32.GetAsyncKeyState(Keys.VK_SHIFT)
-    # if shift & 0x8000:
-    # keybd_event(Keys.VK_SHIFT, 0, KeyboardEventFlag.KeyUp | KeyboardEventFlag.ExtendedKey, 0)
+                else:
+                    if key[1] & KeyboardEventFlag.KeyUp:
+                        if (
+                            keys[i + 1][1] == "UnicodeChar"
+                            or keys[i + 1][1] & KeyboardEventFlag.KeyUp == 0
+                        ):
+                            time.sleep(interval)
+                            if debug:
+                                pass
+                        else:
+                            time.sleep(
+                                hotkeyInterval
+                            )  # must sleep for a while, otherwise combined keys may not be caught
+                            if debug:
+                                pass
+                    else:  # KeyboardEventFlag.KeyDown
+                        time.sleep(hotkeyInterval)
+                        if debug:
+                            pass
+    except BaseException:
+        for vk, (scanCode, flags) in reversed(pressedKeys.items()):
+            try:
+                keybd_event(vk, scanCode, flags, 0)
+            except Exception:
+                # Attempt every release without masking the original failure.
+                pass
+        raise
     time.sleep(waitTime)
 
 
@@ -1895,7 +2129,12 @@ def SetClipboardText(text: str) -> bool:
     with _ClipboardLock:
         if _OpenClipboard(0):
             ctypes.windll.user32.EmptyClipboard()
-            textByteLen = (len(text) + 1) * 2
+            # Size in UTF-16 units, not code points: a character outside the
+            # BMP occupies two units, so len(text) under-allocates and
+            # wcsncpy would stop short of the tail and skip the terminating
+            # NUL, leaving an unterminated CF_UNICODETEXT on the clipboard.
+            unitCount = len(text.encode("utf-16-le")) // 2
+            textByteLen = (unitCount + 1) * 2
             hClipboardData = ctypes.windll.kernel32.GlobalAlloc(0x2, textByteLen)  # GMEM_MOVEABLE
             hDestText = ctypes.windll.kernel32.GlobalLock(ctypes.c_void_p(hClipboardData))
             ctypes.cdll.msvcrt.wcsncpy(
@@ -2092,6 +2331,8 @@ class ExtendedProperty(ctypes.Structure):
         ("PropertyName", ctypes.c_wchar_p),
         ("PropertyValue", ctypes.c_wchar_p),
     ]
+
+
 class UIAutomationEventInfo(ctypes.Structure):
     _fields_ = [
         ("guid", ctypes.c_void_p),
@@ -2408,6 +2649,59 @@ def RemoveAllEventHandlers() -> None:
     Removes all registered Microsoft UI Automation event handlers.
     """
     _AutomationClient.instance().IUIAutomation.RemoveAllEventHandlers()
+
+
+_automation3_instance = None
+
+
+def _get_automation3():
+    """
+    Get an `IUIAutomation3` object, for the TextEdit-changed handlers below.
+
+    The shared `_AutomationClient.instance().IUIAutomation` singleton is normally created
+    from `CUIAutomation8` (see `_AutomationClient._create_client`), but it falls back to the
+    v1 `CUIAutomation` coclass (CLSID `{ff48dba4-...}`), which only ever implements plain
+    `IUIAutomation`: `QueryInterface(IUIAutomation2/3/.../6)` on that fails with
+    E_NOINTERFACE regardless of Windows version. So this still creates and caches its own
+    independent `CUIAutomation8` object instead of trying to upgrade the shared one.
+    """
+    global _automation3_instance
+    if _automation3_instance is None:
+        _automation3_instance = comtypes.client.CreateObject(
+            _AutomationClient.instance().UIAutomationCore.CUIAutomation8,
+            interface=_AutomationClient.instance().UIAutomationCore.IUIAutomation3,
+        )
+    return _automation3_instance
+
+
+def AddTextEditTextChangedEventHandler(
+    element, scope: int, textEditChangeType: int, cacheRequest, handler
+) -> None:
+    """
+    Registers a method that handles UI Automation TextEdit text-changed events -- fired when a
+    control's text changes via IME composition or autocorrect/autocomplete, as opposed to the
+    plain `UIA_Text_TextChangedEventId` which covers ordinary edits.
+    Call IUIAutomation3::AddTextEditTextChangedEventHandler.
+
+    element: the root element to watch (native COM element, e.g. `control.Element`).
+    scope: int, a value in class `TreeScope`.
+    textEditChangeType: int, a value in class `TextEditChangeType`.
+    cacheRequest: a native `IUIAutomationCacheRequest` pointer, or None.
+    handler: `comtypes.COMObject` implementing `IUIAutomationTextEditTextChangedEventHandler`
+        (see `events.TextEditTextChangedEventHandler`).
+    Refer https://learn.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-iuiautomation3-addtexteditwexchangedeventhandler
+    """
+    _get_automation3().AddTextEditTextChangedEventHandler(
+        element, scope, textEditChangeType, cacheRequest, handler
+    )
+
+
+def RemoveTextEditTextChangedEventHandler(element, handler) -> None:
+    """
+    Removes the specified TextEdit text-changed event handler.
+    Call IUIAutomation3::RemoveTextEditTextChangedEventHandler.
+    """
+    _get_automation3().RemoveTextEditTextChangedEventHandler(element, handler)
 
 
 # Condition creation helper functions

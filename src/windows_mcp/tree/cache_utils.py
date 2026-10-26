@@ -5,11 +5,31 @@ This module provides utilities for implementing UI Automation caching
 to reduce cross-process COM calls during tree traversal.
 """
 
-from windows_mcp.uia import CacheRequest, PropertyId, PatternId, TreeScope, Control
+from _ctypes import COMError
+
+from windows_mcp.uia import (
+    CacheRequest,
+    PropertyId,
+    PatternId,
+    TreeScope,
+    Control,
+    UIADeadElementError,
+    from_com_error,
+    is_timeout_exception,
+)
 from typing import Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def is_uia_dead_element_error(error: BaseException) -> bool:
+    """Return True for UIA failures that mean the element no longer exists."""
+    if isinstance(error, UIADeadElementError):
+        return True
+    if isinstance(error, COMError):
+        return isinstance(from_com_error(error), UIADeadElementError)
+    return False
 
 
 class CacheRequestFactory:
@@ -40,6 +60,17 @@ class CacheRequestFactory:
         cache_request.AddProperty(PropertyId.AcceleratorKeyProperty)
         cache_request.AddProperty(PropertyId.ClassNameProperty)
         cache_request.AddProperty(PropertyId.ControlTypeProperty)
+        # RuntimeId is the only exact element identity UIA offers — it is what makes
+        # deduplication sound rather than heuristic. FrameworkId ('Chrome'/'XAML'/
+        # 'Win32'/'WPF') gives per-element provider info; IsContentElement is the
+        # content-view counterpart of the already-cached IsControlElement, and
+        # ClickablePoint is absent on elements that cannot actually be clicked.
+        # These are batched into the existing BuildUpdatedCache round-trip, so they
+        # are effectively free — measured cost is below run-to-run noise.
+        cache_request.AddProperty(PropertyId.RuntimeIdProperty)
+        cache_request.AddProperty(PropertyId.IsContentElementProperty)
+        cache_request.AddProperty(PropertyId.FrameworkIdProperty)
+        cache_request.AddProperty(PropertyId.ClickablePointProperty)
         
         # State properties for visibility and interaction checks
         cache_request.AddProperty(PropertyId.IsEnabledProperty)
@@ -169,5 +200,19 @@ class CachedControlHelper:
             return children
             
         except Exception as e:
+            if is_uia_dead_element_error(e):
+                logger.debug("UIA element is no longer available; pruning stale subtree")
+                return []
+            if is_timeout_exception(e):
+                # The provider did not answer; the uncached fallback would wait out the
+                # same timeout again (once per child call). Let the window fail now.
+                raise
+
             logger.debug(f"Failed to get cached children, falling back to regular access: {e}")
-            return node.GetChildren()
+            try:
+                return node.GetChildren()
+            except Exception as fallback_error:
+                if is_uia_dead_element_error(fallback_error):
+                    logger.debug("UIA element died during fallback; pruning stale subtree")
+                    return []
+                raise

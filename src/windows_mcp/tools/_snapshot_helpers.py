@@ -5,6 +5,7 @@ by the Snapshot and Screenshot tool modules.
 """
 
 import io
+import json
 import logging
 import os
 import time
@@ -12,7 +13,7 @@ import time
 from fastmcp.utilities.types import Image
 from textwrap import dedent
 from windows_mcp.desktop.service import Desktop, Size
-from windows_mcp.desktop.utils import remove_private_use_chars
+from windows_mcp.desktop.utils import remove_private_use_chars, repair_surrogates
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ def _as_bool(value: bool | str) -> bool:
     return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
+def _as_region(value: list | str | None) -> list | None:
+    if value is None or isinstance(value, list):
+        return value
+    return json.loads(value)
+
+
 def capture_desktop_state(
     desktop: Desktop,
     *,
@@ -52,6 +59,7 @@ def capture_desktop_state(
     width_reference_line: int | None,
     height_reference_line: int | None,
     display: list[int] | None,
+    region: list[int] | None,
     tool_name: str,
 ):
     profile_enabled = _snapshot_profile_enabled()
@@ -79,6 +87,7 @@ def capture_desktop_state(
         scale=_screenshot_scale(),
         grid_lines=grid_lines,
         display_indices=display_indices,
+        region=region,
         max_image_size=Size(width=MAX_IMAGE_WIDTH, height=MAX_IMAGE_HEIGHT),
     )
     if profile_enabled:
@@ -128,6 +137,7 @@ def capture_desktop_state(
         "active_desktop": active_desktop,
         "all_desktops": all_desktops,
         "screenshot_bytes": screenshot_bytes,
+        "use_ui_tree": use_ui_tree,
     }
 
 
@@ -154,6 +164,25 @@ def build_snapshot_response(
     scrollable_elements = remove_private_use_chars(scrollable_elements)
     semantic_tree = remove_private_use_chars(semantic_tree)
 
+    # Emoji reach us from UIA as raw UTF-16 surrogate pairs. Left alone they make
+    # the strict UTF-8 JSON encoder reject the entire response, so every string
+    # heading into it is repaired -- window titles included, since an emoji in a
+    # window title is enough to take the whole snapshot down.
+    interactive_elements = repair_surrogates(interactive_elements)
+    scrollable_elements = repair_surrogates(scrollable_elements)
+    semantic_tree = repair_surrogates(semantic_tree)
+    windows = repair_surrogates(windows)
+    active_window = repair_surrogates(active_window)
+    active_desktop = repair_surrogates(active_desktop)
+    all_desktops = repair_surrogates(all_desktops)
+
+    def display_to_string(display):
+        primary = " primary" if display.primary else ""
+        return (
+            f"{display.index}:{display.device_name} "
+            f"{display.bounding_box.xyxy_to_string()}{primary}"
+        )
+
     metadata_text = f"Cursor Position: {desktop_state.cursor_position}\n"
     if desktop_state.screenshot_original_size:
         orig = desktop_state.screenshot_original_size
@@ -169,13 +198,22 @@ def build_snapshot_response(
             )
         else:
             metadata_text += f"Screenshot Size: {orig.to_string()}\n"
-    if desktop_state.screenshot_region:
-        metadata_text += (
-            f"Screenshot Region: {desktop_state.screenshot_region.xyxy_to_string()}\n"
+    if desktop_state.available_displays:
+        metadata_text += "Visible Displays: "
+        metadata_text += "; ".join(
+            display_to_string(display) for display in desktop_state.available_displays
         )
+        metadata_text += "\n"
     if desktop_state.screenshot_displays:
-        metadata_text += f"Displays: {','.join(str(index) for index in desktop_state.screenshot_displays)}\n"
+        metadata_text += f"Selected Displays: {','.join(str(index) for index in desktop_state.screenshot_displays)}\n"
+    if desktop_state.screenshot_region:
+        metadata_text += f"Screenshot Region: {desktop_state.screenshot_region.xyxy_to_string()}\n"
         metadata_text += "Coordinate Space: Virtual desktop coordinates\n"
+        if include_ui_details and capture_result["use_ui_tree"]:
+            metadata_text += (
+                "UI Tree Scope: Region-filtered. Windows and UI elements outside this region "
+                "are omitted. Omit region and display to inspect the full desktop.\n"
+            )
     if desktop_state.screenshot_backend:
         metadata_text += f"Screenshot Backend: {desktop_state.screenshot_backend}\n"
     if ui_detail_note:
@@ -203,5 +241,5 @@ def build_snapshot_response(
 
     response = [response_text]
     if screenshot_bytes:
-        response.append(Image(data=screenshot_bytes, format='png'))
+        response.append(Image(data=screenshot_bytes, format="png"))
     return response

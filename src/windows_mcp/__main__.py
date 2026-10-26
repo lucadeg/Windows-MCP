@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from windows_mcp.config import enable_debug
+from windows_mcp.infrastructure.config import ControlConfig, validate_idle_timeout
 from windows_mcp.infrastructure import (
     AuthKeyMiddleware,
     OAuthOnlyMiddleware,
@@ -15,6 +16,7 @@ from windows_mcp.infrastructure import (
     OAuthStore,
     build_oauth_routes,
     validate_oauth_token,
+    install_selfpipe_guard,
 )
 from click.core import ParameterSource
 from fastmcp import FastMCP
@@ -22,23 +24,51 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from textwrap import dedent
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 import logging
 import asyncio
 import shlex
 import secrets
 import subprocess
+import threading
 import click
 import os
 import sys
 
 logger = logging.getLogger(__name__)
 
+
+def _echo_section(title: str) -> None:
+    """Print a section heading via click.echo, falling back to ASCII
+    when the current stdout encoding can't represent the U+2500
+    box-drawing character.
+
+    Without this guard, `windows-mcp auth` crashes on the default
+    PowerShell / cmd console (cp1252) with a UnicodeEncodeError when
+    click.echo hits ─. The config file is already written at this
+    point, but the noisy traceback obscures the success and breaks
+    scripted callers that treat exit-nonzero as a real failure.
+    Setting PYTHONIOENCODING=utf-8 is a workaround; this is the fix.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    # Older Ruff releases drop the required parentheses around this exception tuple.
+    # fmt: off
+    try:
+        "─".encode(enc)
+        bar = "─" * 3
+    except (UnicodeEncodeError, LookupError):
+        bar = "==="
+    # fmt: on
+    click.echo(f"\n{bar} {title} {bar}")
+
+
 desktop: Any | None = None
 watchdog: Any | None = None
 analytics: Any | None = None
 screen_size: Any | None = None
 _mcp: FastMCP | None = None
+_control_config = ControlConfig()
+_control_notifier: Any | None = None
 
 instructions = dedent("""
 Windows MCP server provides tools to interact directly with the Windows desktop,
@@ -103,6 +133,13 @@ def _choose_value(ctx: click.Context, name: str, cli_value, config_value, defaul
     return default_value
 
 
+def _control_timeout_option(ctx, param, value):
+    try:
+        return validate_idle_timeout(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), ctx=ctx, param=param) from exc
+
+
 class OptionsMiddleware:
     """ASGI middleware that intercepts OPTIONS preflight requests.
 
@@ -139,43 +176,199 @@ class OptionsMiddleware:
             await self.app(scope, receive, send)
 
 
+def _watchdog_enabled() -> bool:
+    """Whether the UIA focus WatchDog should run. Off unless asked for.
+
+    Reads the ``WINDOWS_MCP_WATCHDOG`` environment variable. Enabling values
+    (case-insensitive, whitespace-trimmed): ``on``, ``1``, ``true``, ``yes``,
+    ``enabled``. Unset, or anything else, leaves it off.
+
+    It is opt-in because it no longer earns its cost. Its only surviving
+    consumer is ``Tree.on_focus_change``, which debounces the event and writes
+    a debug log line -- the structure-change handling that once maintained
+    ``tree_state.interactive_nodes`` was removed, and nothing reads the focus
+    state it tracks. Against that, running it costs a dedicated STA thread, a
+    long-lived UIA event subscription, and exposure to a native access
+    violation in the event pump that takes the whole server down with no
+    Python traceback (#332). The accessibility tree is built on demand for
+    every tool call regardless, so leaving it off changes no tool behaviour.
+
+    Returns:
+        ``True`` when the watchdog should be started, ``False`` to skip it.
+    """
+    value = os.getenv("WINDOWS_MCP_WATCHDOG")
+    if value is None:
+        return False
+    return value.strip().lower() in {"on", "1", "true", "yes", "enabled"}
+
+
+def _exit_missing_dependency(exc: ModuleNotFoundError) -> NoReturn:
+    """Report a missing runtime dependency on stderr and exit non-zero.
+
+    A partially populated venv -- an interrupted `uv sync`, or one invalidated
+    by an interpreter change -- leaves `windows_mcp` importable next to missing
+    third-party packages. Without this guard the traceback is the only output,
+    and MCP hosts do not surface it: Claude Desktop reports "Server
+    disconnected" alone, so neither the failing module nor the remedy reaches
+    the user. Written to stderr because stdout carries the stdio protocol
+    stream. `uv sync` repairs any declared dependency, so the message points
+    there rather than mapping the import name back to its distribution.
+    """
+    logger.debug("Startup import failed", exc_info=exc)
+    click.echo(
+        f"windows-mcp: cannot start -- {exc}. The environment looks partially "
+        f"installed; run `uv sync` in the extension directory, then restart the client.",
+        err=True,
+    )
+    sys.exit(1)
+
+
+def _start_watchdog(desktop):
+    """Create and start the UIA WatchDog, or return None if it is unavailable.
+
+    The watchdog only refreshes cached UI state, but importing it builds COM
+    interface wrappers at module scope. A transient codegen or COM failure
+    there used to abort startup and take every tool down with it, so failures
+    degrade to running without a watchdog instead. See #374 for the
+    comtypes.gen generation race and #332 for the COM failures.
+    """
+    if not _watchdog_enabled():
+        logger.debug("WatchDog disabled via WINDOWS_MCP_WATCHDOG")
+        return None
+
+    watchdog = None
+    try:
+        # Imported lazily so a disabled watchdog never loads comtypes.
+        from windows_mcp.watchdog.service import WatchDog
+
+        watchdog = WatchDog()
+        watchdog.set_focus_callback(desktop.tree.on_focus_change)
+        watchdog.start()
+        return watchdog
+    except Exception:
+        logger.warning("WatchDog unavailable; continuing without it", exc_info=True)
+        if watchdog is not None:
+            watchdog.stop()
+        return None
+
+
 def _build_mcp() -> FastMCP:
     """Create the MCP server instance."""
-    global _mcp
+    global _mcp, _control_notifier
 
     if _mcp is not None:
         return _mcp
 
-    from windows_mcp.infrastructure import PostHogAnalytics
-    from windows_mcp.desktop.service import Desktop
-    from windows_mcp.tools import register_all
-    from windows_mcp.watchdog.service import WatchDog
+    try:
+        from windows_mcp.infrastructure import PostHogAnalytics
+        from windows_mcp.desktop.service import Desktop
+        from windows_mcp.tools import register_all
+    except ModuleNotFoundError as exc:
+        _exit_missing_dependency(exc)
+    from windows_mcp.tools.control_notifications import ControlNotifier, ControlToolGate
+    from windows_mcp.desktop.control import get_controller
+    from windows_mcp.desktop import control_overlay
+
+    controller = get_controller()
+    notifier = ControlNotifier(controller)
+    _control_notifier = notifier
+    control_loop: asyncio.AbstractEventLoop | None = None
+
+    def apply_control_state(status: dict) -> None:
+        try:
+            # Queued input-thread updates can arrive after a later takeover.
+            # Never let an old AI event re-show the indicator in user mode.
+            if status.get("generation") is not None and status[
+                "generation"
+            ] != controller.status().get("generation"):
+                return
+            generation = status.get("generation")
+            if status["state"] == "ai":
+                applied = control_overlay.set_active(True, generation=generation)
+                if applied and generation is not None:
+                    controller.arm_visible(status["generation"])
+            elif status["state"] == "takeover_pending":
+                control_overlay.set_pending(True, generation=generation)
+            else:
+                control_overlay.set_active(False, generation=generation)
+        except Exception:
+            # A missing visual indicator invalidates the AI control lease.
+            controller._fail_open()
+            logger.exception("AI control indicator failed; releasing physical input")
+
+    def show_control_state(status: dict) -> None:
+        if threading.current_thread() is controller._thread or not (
+            status["state"] == "ai" and controller.visible_ack_required()
+        ):
+            # Never wait for a window-owner acknowledgement on the hook thread.
+            # A capture may hold the overlay lock for an unbounded backend call;
+            # only a new MCP lease may wait for the visible AI acknowledgement.
+            # Other state transitions must not block the MCP event loop.
+            try:
+                if control_loop is None or control_loop.is_closed():
+                    raise RuntimeError("server event loop unavailable")
+                control_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        asyncio.to_thread(apply_control_state, status.copy())
+                    )
+                )
+            except RuntimeError:
+                controller._fail_open()
+                logger.exception("Could not schedule AI control indicator update")
+        else:
+            # begin_call waits for the visible AI indicator before any tool runs.
+            apply_control_state(status)
+
+    controller.subscribe(show_control_state)
 
     @asynccontextmanager
     async def lifespan(app: FastMCP):
         """Runs initialization code before the server starts and cleanup code after it shuts down."""
         global desktop, watchdog, analytics, screen_size
+        nonlocal control_loop
+        control_loop = asyncio.get_running_loop()
 
         if os.getenv("ANONYMIZED_TELEMETRY", "true").lower() != "false":
             analytics = PostHogAnalytics()
         desktop = Desktop()
-        watchdog = WatchDog()
         screen_size = desktop.get_screen_size()
-        watchdog.set_focus_callback(desktop.tree.on_focus_change)
+
+        watchdog = _start_watchdog(desktop)
+
+        # Set thresholds before installing input hooks; invalid TOML was rejected at load.
+        controller.mouse_takeover_units = _control_config.mouse_takeover_units
+        controller.mouse_takeover_pixels = _control_config.mouse_takeover_pixels
+        controller.enabled = _control_config.enabled
+        controller.policy = _control_config.policy
+        controller.idle_timeout_seconds = _control_config.idle_timeout_seconds
 
         try:
-            watchdog.start()
-            await asyncio.sleep(1)  # Simulate startup latency
+            if controller.enabled:
+                control_overlay.start()
+                controller.set_health_probe(control_overlay.is_healthy)
+            controller.start()
+            if controller.enabled:
+                notifier.start()
             logger.debug("Server started, entering main loop")
             yield
         finally:
-            logger.debug("Shutting down: stopping watchdog and analytics")
-            if watchdog:
-                watchdog.stop()
-            if analytics:
-                await analytics.close()
+            await notifier.close()
+            try:
+                controller.stop()
+            finally:
+                try:
+                    if controller.enabled:
+                        control_overlay.stop()
+                finally:
+                    logger.debug("Shutting down: stopping watchdog and analytics")
+                    if watchdog:
+                        watchdog.stop()
+                    if analytics:
+                        await analytics.close()
+                    control_loop = None
 
     _mcp = FastMCP(name="windows-mcp", instructions=instructions, lifespan=lifespan)
+    _mcp.add_middleware(ControlToolGate(controller, notifier))
     register_all(_mcp, get_desktop=_get_desktop, get_analytics=_get_analytics)
     return _mcp
 
@@ -217,6 +410,10 @@ _LEGACY_SERVE_FLAGS = {
     "--exclude-tools",
     "--allow-insecure-remote",
     "--debug",
+    "--control",
+    "--no-control",
+    "--control-idle-timeout",
+    "--control-policy",
 }
 
 
@@ -286,11 +483,12 @@ def _apply_tool_filter(
 
     if explicit_tools:
         keep = {t for t in explicit_tools if t in registered}
+        keep.add("ControlStatus")
         for name in registered - keep:
             _remove(name)
     elif exclude_tools:
         for name in exclude_tools:
-            if name in registered:
+            if name in registered and name != "ControlStatus":
                 _remove(name)
     logger.debug("Tool filter applied: explicit=%s exclude=%s", explicit_tools, exclude_tools)
 
@@ -311,6 +509,11 @@ def _run_server(
     stateless_http: bool = False,
 ) -> None:
     mcp = _build_mcp()
+    if _control_notifier is not None:
+        # stdio has one session until process exit; stateless HTTP has no
+        # durable session to which a later ownership event can be pushed.
+        _control_notifier.ttl = float("inf") if transport == "stdio" else 60.0
+        _control_notifier.push_enabled = not (transport == "streamable-http" and stateless_http)
     if explicit_tools or exclude_tools:
         _apply_tool_filter(mcp, explicit_tools, exclude_tools)
     match transport:
@@ -470,6 +673,30 @@ def main():
     envvar="WINDOWS_MCP_STATELESS_HTTP",
     show_default=True,
 )
+@click.option(
+    "--control/--no-control",
+    default=True,
+    envvar="WINDOWS_MCP_CONTROL",
+    show_default=True,
+    help="Enable desktop ownership, input protection and control indicator. Restart required.",
+)
+@click.option(
+    "--control-idle-timeout",
+    type=float,
+    default=10.0,
+    show_default=True,
+    envvar="WINDOWS_MCP_CONTROL_IDLE_TIMEOUT",
+    callback=_control_timeout_option,
+    help="Positive finite user idle wait in seconds before control resumes. Restart required.",
+)
+@click.option(
+    "--control-policy",
+    type=click.Choice(["relaxed", "balanced", "strict"]),
+    default="relaxed",
+    envvar="WINDOWS_MCP_CONTROL_POLICY",
+    show_default=True,
+    help="Desktop gate: relaxed (direct actions), balanced (also possible interference), strict (all tools). Restart required.",
+)
 def serve(
     ctx,
     transport,
@@ -488,8 +715,13 @@ def serve(
     oauth_client_id,
     oauth_client_secret,
     stateless_http,
+    control,
+    control_idle_timeout,
+    control_policy,
 ):
+    global _control_config
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    install_selfpipe_guard()
     if transport == Transport.STDIO.value:
         os.environ.setdefault("NO_COLOR", "1")
     if debug:
@@ -504,6 +736,14 @@ def serve(
         cfg = load_config(config_path)
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc))
+    _control_config = cfg.control
+    _control_config.policy = _choose_value(
+        ctx, "control_policy", control_policy, cfg.control.policy, "relaxed"
+    )
+    _control_config.enabled = _choose_value(ctx, "control", control, cfg.control.enabled, True)
+    _control_config.idle_timeout_seconds = _choose_value(
+        ctx, "control_idle_timeout", control_idle_timeout, cfg.control.idle_timeout_seconds, 10.0
+    )
 
     transport = _choose_value(ctx, "transport", transport, cfg.server.transport, "stdio")
     host = _choose_value(ctx, "host", host, cfg.server.host, "localhost")
@@ -729,8 +969,25 @@ def _build_start_script(program_args: list[str]) -> str:
     return f'@echo off\nsetlocal\n{command} 1>>"{log_out}" 2>>"{log_err}"\n'
 
 
+def _run_console_tool(args: list[str]) -> subprocess.CompletedProcess:
+    """Run a Windows console tool and capture its output as text.
+
+    schtasks and PowerShell write in the console code page (GBK on a zh-CN system),
+    not in UTF-8 or the locale encoding text=True would use. Decoding with the wrong
+    codec raises UnicodeDecodeError in subprocess's reader thread, which prints a
+    traceback and drops the output. Decode with the OEM code page instead, and replace
+    anything that still does not fit rather than failing.
+    """
+    return subprocess.run(args, capture_output=True, encoding="oem", errors="replace")
+
+
 def _schtasks(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["schtasks", *args], capture_output=True, text=True)
+    return _run_console_tool(["schtasks", *args])
+
+
+def _headless_task_argument(script_path: str) -> str:
+    """Return the conhost argument string that runs ``script_path`` without a visible window."""
+    return f'--headless cmd.exe /c "{script_path}"'
 
 
 def _register_task_powershell(task_name: str, script_path: str) -> subprocess.CompletedProcess:
@@ -738,19 +995,21 @@ def _register_task_powershell(task_name: str, script_path: str) -> subprocess.Co
 
     Unlike `schtasks /Create /SC ONLOGON`, Register-ScheduledTask with
     -RunLevel Limited does not require an elevated shell.
+
+    The .cmd wrapper is started through ``conhost.exe --headless`` so the long-running
+    server gets a hidden console. Executing the .cmd directly allocates a visible
+    console (a Windows Terminal window on Windows 11) that stays open for the whole
+    session, and closing it kills the server.
     """
     ps = (
-        f"$action  = New-ScheduledTaskAction -Execute '{script_path}';"
+        f"$action  = New-ScheduledTaskAction -Execute 'conhost.exe'"
+        f" -Argument '{_headless_task_argument(script_path)}';"
         f"$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
         f"$set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
         f"Register-ScheduledTask -TaskName '{task_name}' -Action $action"
         f" -Trigger $trigger -Settings $set -RunLevel Limited -Force"
     )
-    return subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-        capture_output=True,
-        text=True,
-    )
+    return _run_console_tool(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
 
 
 @main.command()
@@ -877,7 +1136,7 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
     click.echo(f"\nSaved to {config_path}")
 
     if transport == "stdio":
-        click.echo("\n─── Claude Desktop config (stdio) ───")
+        _echo_section("Claude Desktop config (stdio)")
         click.echo(
             """\
 {
@@ -895,11 +1154,11 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
     mcp_url = f"{scheme}://{host}:{port}/mcp/"
     sse_url = f"{scheme}://{host}:{port}/sse"
 
-    click.echo("\n─── Start the server ───")
+    _echo_section("Start the server")
     click.echo("  windows-mcp serve")
 
     if transport == "sse":
-        click.echo("\n─── Claude Desktop config (SSE) ───")
+        _echo_section("Claude Desktop config (SSE)")
         click.echo(
             f"""\
 {{
@@ -913,7 +1172,7 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
 }}"""
         )
     else:
-        click.echo("\n─── Claude Desktop config (Streamable HTTP) ───")
+        _echo_section("Claude Desktop config (Streamable HTTP)")
         click.echo(
             f"""\
 {{

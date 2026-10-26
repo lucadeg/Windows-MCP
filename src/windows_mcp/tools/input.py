@@ -1,11 +1,14 @@
 """Input tools — Click, Type, Scroll, Move, Shortcut, Wait, WaitFor."""
 
 import json
+import math
+import re
 import time
 from collections.abc import Callable, Iterator
 from typing import Any, Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp.desktop.utils import as_bool as _as_bool
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
 
@@ -29,8 +32,9 @@ def _resolve_label(desktop: Any, label: int) -> list[int]:
         raise ValueError(f"Failed to find element with label {label}: {e}")
 
 
-def _as_bool(value: bool | str) -> bool:
-    return value is True or (isinstance(value, str) and value.lower() == "true")
+def _validate_finite_number(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
 
 
 def _as_loc(value: list | str | None) -> list | None:
@@ -42,6 +46,33 @@ def _as_loc(value: list | str | None) -> list | None:
     if value is None or isinstance(value, list):
         return value
     return json.loads(value)
+
+
+# One optional leading sign followed by decimal digits — exactly what int()
+# accepts. `.lstrip("+-").isdigit()` used to strip *any* run of signs, so
+# "+-5"/"--5" passed the check and then int() raised a confusing low-level
+# error instead of the intended message; `.isdigit()` also accepts digits
+# int() rejects (e.g. the superscript "²").
+_SIGNED_INT_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _as_point(value: object, name: str) -> list[int]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{name} must be a list of exactly 2 integers [x, y]")
+    parsed = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(f"{name} must contain integers, not booleans")
+        if isinstance(item, int):
+            parsed.append(item)
+            continue
+        if isinstance(item, str):
+            stripped = item.strip()
+            if _SIGNED_INT_RE.match(stripped):
+                parsed.append(int(stripped))
+                continue
+        raise ValueError(f"{name} must contain exactly 2 integers")
+    return parsed
 
 
 def _text_matches(value: object | None, expected: str | None) -> bool:
@@ -139,6 +170,9 @@ def _validate_wait_for_args(
     timeout: float,
     interval: float,
 ) -> WaitForCondition:
+    _validate_finite_number(timeout, "timeout")
+    _validate_finite_number(interval, "interval")
+
     normalized = condition.strip().lower().replace("-", "_")
     aliases = {
         "text": "text_exists",
@@ -200,7 +234,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Click-Tool")
+    @with_analytics(get_analytics(), "Click-Tool", run_sync_in_thread=False)
     def click_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
@@ -223,7 +257,7 @@ def register(
 
     @mcp.tool(
         name="Type",
-        description="Types text at specified coordinates [x, y] or passing a UI element's label/id. Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). Provide either loc or label.",
+        description="Types text at specified coordinates [x, y] or passing a UI element's label/id. Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). Provide either loc or label. clear and press_enter accept only true or false. An empty text types nothing, so combine it with clear=True to just empty a field.",
         annotations=ToolAnnotations(
             title="Type",
             readOnlyHint=False,
@@ -232,7 +266,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Type-Tool")
+    @with_analytics(get_analytics(), "Type-Tool", run_sync_in_thread=False)
     def type_tool(
         text: str,
         loc: list[int] | str | None = None,
@@ -244,6 +278,8 @@ def register(
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
+        clear = _as_bool(clear, "clear")
+        press_enter = _as_bool(press_enter, "press_enter")
         if loc is None and label is None:
             raise ValueError("Either loc or label must be provided.")
         if label is not None:
@@ -271,7 +307,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Scroll-Tool")
+    @with_analytics(get_analytics(), "Scroll-Tool", run_sync_in_thread=False)
     def scroll_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
@@ -301,37 +337,68 @@ def register(
         description=(
             "Moves mouse cursor to coordinates [x, y] or passing a UI element's label/id. "
             "Set drag=True to perform a drag-and-drop operation from the current mouse position "
-            "to the target coordinates. Default (drag=False) is a simple cursor move (hover). "
+            "to the target coordinates, or provide from_loc=[x, y] to make the drag explicit-start "
+            "and atomic in one tool call. Optional duration controls bounded intermediate movement. "
+            "Default (drag=False) is a simple cursor move (hover). "
             "Provide either loc or label."
         ),
         annotations=ToolAnnotations(
             title="Move",
             readOnlyHint=False,
-            destructiveHint=False,
-            idempotentHint=True,
+            destructiveHint=True,
+            idempotentHint=False,
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Move-Tool")
+    @with_analytics(get_analytics(), "Move-Tool", run_sync_in_thread=False)
     def move_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
         drag: bool | str = False,
+        from_loc: list[int] | str | None = None,
+        duration: float | int | str | None = None,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
-        drag = drag is True or (isinstance(drag, str) and drag.lower() == "true")
+        from_loc = _as_loc(from_loc)
+        drag = _as_bool(drag, "drag")
         if loc is None and label is None:
             raise ValueError("Either loc or label must be provided.")
         if label is not None:
             loc = _resolve_label(desktop, label)
-        if len(loc) != 2:
+        if not isinstance(loc, list) or len(loc) != 2:
             raise ValueError("loc must be a list of exactly 2 integers [x, y]")
+        if from_loc is not None and (not isinstance(from_loc, list) or len(from_loc) != 2):
+            raise ValueError("from_loc must be a list of exactly 2 integers [x, y]")
+        has_drag_only_options = any(
+            value is not None
+            for value in (
+                from_loc,
+                duration,
+            )
+        )
+        if has_drag_only_options and not drag:
+            raise ValueError("from_loc and duration require drag=True")
+        if drag:
+            loc = _as_point(loc, "loc")
+            if from_loc is not None:
+                from_loc = _as_point(from_loc, "from_loc")
         x, y = loc[0], loc[1]
         if drag:
-            desktop.drag(loc)
-            return f"Dragged to ({x},{y})."
+            result = desktop.drag(
+                loc,
+                from_loc=from_loc,
+                duration=duration,
+            )
+            start_x, start_y = result["start"]
+            effective_duration = result["duration"]
+            if effective_duration is None:
+                return f"Dragged from ({start_x},{start_y}) to ({x},{y})."
+            return (
+                f"Dragged from ({start_x},{start_y}) to ({x},{y}) "
+                f"over {effective_duration:.3f} seconds."
+            )
         else:
             desktop.move(loc)
             return f"Moved the mouse pointer to ({x},{y})."
@@ -384,7 +451,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "WaitFor-Tool")
+    @with_analytics(get_analytics(), "WaitFor-Tool", run_sync_in_thread=False)
     def wait_for_tool(
         condition: str,
         text: str | None = None,
@@ -402,7 +469,7 @@ def register(
             interval=interval,
         )
         desktop = get_desktop()
-        use_dom_bool = _as_bool(use_dom)
+        use_dom_bool = _as_bool(use_dom, "use_dom")
         started_at = time.monotonic()
         deadline = started_at + timeout
         attempts = 0

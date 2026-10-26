@@ -1,64 +1,63 @@
+from pathlib import Path
 from unittest.mock import Mock
 
 from click.testing import CliRunner
+import pytest
 
 from windows_mcp.__main__ import main
 import windows_mcp.__main__ as cli
 
 
-def test_resolve_program_prefers_installed_script(monkeypatch):
-    monkeypatch.setattr(cli.shutil, "which", lambda name: "C:\\Tools\\windows-mcp.exe" if name == "windows-mcp" else None)
+def test_resolve_program_uses_running_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.sys, "executable", "C:\\Tools\\python.exe")
 
-    assert cli._resolve_program() == ["C:\\Tools\\windows-mcp.exe"]
-
-
-def test_resolve_program_falls_back_to_uvx_for_ephemeral_uv_cache(monkeypatch):
-    def fake_which(name: str):
-        if name == "windows-mcp":
-            return "C:\\Users\\me\\.cache\\uv\\archive\\bin\\windows-mcp.exe"
-        if name == "uvx":
-            return "C:\\Tools\\uvx.exe"
-        return None
-
-    monkeypatch.setattr(cli.shutil, "which", fake_which)
-
-    assert cli._resolve_program() == ["C:\\Tools\\uvx.exe", "windows-mcp"]
+    assert cli._resolve_program() == ["C:\\Tools\\python.exe", "-m", "windows_mcp"]
 
 
-def test_install_writes_start_script_and_creates_task(monkeypatch, tmp_path):
+def test_install_writes_start_script_and_creates_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
     start_script = tmp_path / "start server.cmd"
     monkeypatch.setattr(cli, "_START_SCRIPT_PATH", start_script)
-    monkeypatch.setattr(cli, "_resolve_program", lambda: ["C:\\Tools\\windows-mcp.exe"])
+    monkeypatch.setattr(cli.sys, "executable", "C:\\Program Files\\Python\\python.exe")
 
-    calls = []
+    calls: list[tuple[str, ...]] = []
+    registrations: list[tuple[str, str]] = []
 
-    def fake_schtasks(*args: str):
+    def fake_schtasks(*args: str) -> Mock:
         calls.append(args)
         if args[:2] == ("/Query", "/TN"):
-            return Mock(returncode=1, stdout="", stderr="ERROR: The system cannot find the file specified.")
+            return Mock(
+                returncode=1,
+                stdout="",
+                stderr="ERROR: The system cannot find the file specified.",
+            )
         return Mock(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(cli, "_schtasks", fake_schtasks)
+    monkeypatch.setattr(
+        cli,
+        "_register_task_powershell",
+        lambda task_name, script_path: registrations.append((task_name, script_path))
+        or Mock(returncode=0, stdout="", stderr=""),
+    )
 
-    result = runner.invoke(main, ["install", "--transport", "sse", "--host", "127.0.0.1", "--port", "9000"])
+    result = runner.invoke(
+        main,
+        ["install", "--transport", "sse", "--host", "127.0.0.1", "--port", "9000"],
+    )
 
     assert result.exit_code == 0, result.output
     script = start_script.read_text(encoding="utf-8")
-    assert "windows-mcp.exe serve --transport sse --host 127.0.0.1 --port 9000" in script
+    assert (
+        '"C:\\Program Files\\Python\\python.exe" -m windows_mcp serve --transport sse '
+        "--host 127.0.0.1 --port 9000"
+    ) in script
     assert '1>>"' in script
     assert '2>>"' in script
-    assert (
-        "/Create",
-        "/SC",
-        "ONLOGON",
-        "/TN",
-        cli._TASK_NAME,
-        "/TR",
-        f'"{start_script}"',
-        "/F",
-    ) in calls
+    assert registrations == [(cli._TASK_NAME, str(start_script))]
     assert ("/Run", "/TN", cli._TASK_NAME) in calls
 
 

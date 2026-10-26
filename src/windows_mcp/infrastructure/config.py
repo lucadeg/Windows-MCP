@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,10 +40,21 @@ class ToolsConfig:
 
 
 @dataclass
+class ControlConfig:
+    # Raw relative device units and hook screen pixels are intentionally separate.
+    mouse_takeover_units: int = 500
+    mouse_takeover_pixels: int = 500  # Accepted for compatibility; pixel fallback is disabled.
+    enabled: bool = True
+    idle_timeout_seconds: float = 10.0
+    policy: str = "relaxed"
+
+
+@dataclass
 class WindowsMCPConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    control: ControlConfig = field(default_factory=ControlConfig)
     source_path: Path | None = None
 
 
@@ -90,6 +102,19 @@ def _strict_int(raw: object, key: str) -> int:
     raise ValueError(f"{key} must be a TOML integer, not {type(raw).__name__}")
 
 
+def validate_idle_timeout(raw: object) -> float:
+    """Share finite, positive timeout validation between TOML and CLI inputs."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("control.idle_timeout_seconds must be a finite positive number")
+    try:
+        value = float(raw)
+    except OverflowError:
+        raise ValueError("control.idle_timeout_seconds must be a finite positive number") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("control.idle_timeout_seconds must be a finite positive number")
+    return value
+
+
 def load_config(path: Path | None) -> WindowsMCPConfig:
     """Load and validate TOML config file. Returns defaults when path is None."""
     cfg = WindowsMCPConfig()
@@ -104,6 +129,7 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     server = data.get("server", {})
     security = data.get("security", {})
     tools = data.get("tools", {})
+    control = data.get("control", {})
 
     _VALID_TRANSPORTS = {"stdio", "sse", "streamable-http"}
     if "transport" in server:
@@ -154,6 +180,23 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     if "exclude" in tools:
         cfg.tools.exclude = _list_of_strings(tools["exclude"], "tools.exclude")
 
+    if "policy" in control:
+        if control["policy"] not in ("relaxed", "balanced", "strict"):
+            raise ValueError("control.policy must be relaxed, balanced, or strict")
+        cfg.control.policy = control["policy"]
+
+    if "enabled" in control:
+        cfg.control.enabled = _strict_bool(control["enabled"], "control.enabled")
+    if "idle_timeout_seconds" in control:
+        cfg.control.idle_timeout_seconds = validate_idle_timeout(control["idle_timeout_seconds"])
+
+    for key in ("mouse_takeover_units", "mouse_takeover_pixels"):
+        if key in control:
+            value = _strict_int(control[key], f"control.{key}")
+            if not 40 <= value <= 2000:
+                raise ValueError(f"control.{key} must be between 40 and 2000")
+            setattr(cfg.control, key, value)
+
     cfg.source_path = path
     return cfg
 
@@ -201,5 +244,20 @@ def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
     if cfg.tools.exclude:
         items = ", ".join(f'"{t}"' for t in cfg.tools.exclude)
         lines += ["[tools]", f"exclude = [{items}]", ""]
+
+    ctrl, default_ctrl = cfg.control, ControlConfig()
+    control_lines = [
+        f"{key} = {getattr(ctrl, key)}"
+        for key in ("mouse_takeover_units", "mouse_takeover_pixels")
+        if getattr(ctrl, key) != getattr(default_ctrl, key)
+    ]
+    if ctrl.policy != default_ctrl.policy:
+        control_lines.append(f'policy = "{ctrl.policy}"')
+    if ctrl.enabled != default_ctrl.enabled:
+        control_lines.append(f"enabled = {str(ctrl.enabled).lower()}")
+    if ctrl.idle_timeout_seconds != default_ctrl.idle_timeout_seconds:
+        control_lines.append(f"idle_timeout_seconds = {ctrl.idle_timeout_seconds}")
+    if control_lines:
+        lines += ["[control]", *control_lines, ""]
 
     path.write_text("\n".join(lines), encoding="utf-8")

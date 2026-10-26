@@ -16,7 +16,6 @@ from windows_mcp.filesystem.views import (
     MAX_RESULTS,
     File,
     Directory,
-    format_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +90,9 @@ def copy_path(source: str, destination: str, overwrite: bool = False) -> str:
     if not src.exists():
         return f'Error: Source not found: {src}'
 
+    if src == dst or dst in src.parents or (src.is_dir() and src in dst.parents):
+        return 'Error: Source and destination paths overlap.'
+
     if dst.exists() and not overwrite:
         return f'Error: Destination already exists: {dst}. Set overwrite=True to replace.'
 
@@ -123,6 +125,9 @@ def move_path(source: str, destination: str, overwrite: bool = False) -> str:
     if not src.exists():
         return f'Error: Source not found: {src}'
 
+    if src == dst or dst in src.parents or (src.is_dir() and src in dst.parents):
+        return 'Error: Source and destination paths overlap.'
+
     if dst.exists() and not overwrite:
         return f'Error: Destination already exists: {dst}. Set overwrite=True to replace.'
 
@@ -145,14 +150,19 @@ def move_path(source: str, destination: str, overwrite: bool = False) -> str:
 
 
 def delete_path(path: str, recursive: bool = False) -> str:
-    """Delete a file or directory."""
-    target = Path(path).resolve()
-
-    if not target.exists():
-        return f'Error: Path not found: {target}'
+    """Delete a file or directory, removing links without following their targets."""
+    target = Path(path).absolute()
 
     try:
-        if target.is_file() or target.is_symlink():
+        if target.is_symlink():
+            target.unlink()
+            return f'Deleted file: {target}'
+        if target.is_junction():
+            target.rmdir()
+            return f'Deleted directory: {target}'
+        if not target.exists():
+            return f'Error: Path not found: {target}'
+        if target.is_file():
             target.unlink()
             return f'Deleted file: {target}'
         elif target.is_dir():
@@ -194,7 +204,9 @@ def list_directory(path: str, pattern: str | None = None, recursive: bool = Fals
             iterator = dir_path.iterdir()
 
         for entry in sorted(iterator, key=lambda e: (not e.is_dir(), e.name.lower())):
-            if not show_hidden and entry.name.startswith('.'):
+            if not show_hidden and any(
+                part.startswith('.') for part in entry.relative_to(dir_path).parts
+            ):
                 continue
             if pattern and not recursive and not fnmatch.fnmatch(entry.name, pattern):
                 continue
@@ -300,7 +312,7 @@ def get_file_info(path: str) -> str:
         if target.is_dir():
             try:
                 items = list(target.iterdir())
-                file.contents_dirs = sum(1 for i in items if i.is_dir())    
+                file.contents_dirs = sum(1 for i in items if i.is_dir())
                 file.contents_files = sum(1 for i in items if i.is_file())
             except PermissionError:
                 pass

@@ -1,17 +1,22 @@
 from __future__ import annotations
-
-from windows_mcp.uia import Control, ComboBoxControl, CheckBoxControl, EditControl, ButtonControl, SliderControl, ScrollPattern, WindowControl, Rect, ExpandCollapseState, ToggleState, PatternId, PropertyId, AccessibleRoleNames, TreeScope, ControlFromHandle, UIADeadElementError, from_com_error
-from _ctypes import COMError
+from windows_mcp.uia import Control, ComboBoxControl, DocumentControl, CheckBoxControl, EditControl, ButtonControl, SliderControl, ScrollPattern, WindowControl, ImageControl, Rect, ExpandCollapseState, ToggleState, PatternId, PropertyId, AccessibleRoleNames, TreeScope, ControlFromHandle, UIADeadElementError, from_com_error, is_timeout_exception, TextPatternRangeEndpoint
 from windows_mcp.tree.config import INTERACTIVE_CONTROL_TYPE_NAMES, DOCUMENT_CONTROL_TYPE_NAMES, INFORMATIVE_CONTROL_TYPE_NAMES, DEFAULT_ACTIONS, INTERACTIVE_ROLES, THREAD_MAX_RETRIES, STRUCTURAL_CONTROL_TYPE_NAMES
 from windows_mcp.tree.views import TreeElementNode, ScrollElementNode, TextElementNode, Center, BoundingBox, TreeState, SemanticNode, _prune_structural, _reverse_children_order
-from windows_mcp.tree.cache_utils import CacheRequestFactory, CachedControlHelper
+from windows_mcp.tree.cache_utils import (
+    CacheRequestFactory,
+    CachedControlHelper,
+    is_uia_dead_element_error,
+)
+from windows_mcp.tree.budget import TreeElementBudget, resolve_max_tree_elements
 from windows_mcp.tree.utils import random_point_within_bounding_box
 from windows_mcp.tree import ia2 as ia2_traversal
 from typing import TYPE_CHECKING,Optional,Any
 from time import sleep,perf_counter
+from _ctypes import COMError
+from psutil import Process
 import logging
 import weakref
-import ctypes
+import win32process
 import os
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,43 @@ _COMTYPES_AUTOMATION_PATH_FRAGMENT = "comtypes/automation.py"
 def _snapshot_profile_enabled() -> bool:
     value = os.getenv("WINDOWS_MCP_PROFILE_SNAPSHOT", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _excluded_process_names(env: "os._Environ[str] | dict[str, str] | None" = None) -> set[str]:
+    """Read the UI Automation traversal exclusion list from the environment.
+
+    Args:
+        env: Mapping to read from. Defaults to ``os.environ``.
+
+    Returns:
+        Case-folded process basenames listed in
+        ``WINDOWS_MCP_EXCLUDE_PROCESSES``, or an empty set when the variable is
+        unset or holds no non-blank entry.
+    """
+    source = os.environ if env is None else env
+    raw = source.get("WINDOWS_MCP_EXCLUDE_PROCESSES", "")
+    return {part.strip().casefold() for part in raw.split(",") if part.strip()}
+
+
+def _window_process_name(handle: int) -> Optional[str]:
+    """Return the executable basename that owns `handle`.
+
+    Resolves HWND -> PID -> process name using Win32 and psutil only, never UI
+    Automation: an excluded window's accessibility provider must not be entered
+    just to decide whether to skip it.
+
+    Returns:
+        The process name, or None when no owning process can be resolved. A None
+        result is treated as "not excluded" so traversal falls back to its
+        previous behaviour.
+    """
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(handle)
+        if not pid:
+            return None
+        return Process(pid).name()
+    except Exception:
+        return None
 
 
 def _is_comtypes_variant_ord_typeerror(error: TypeError) -> bool:
@@ -40,6 +82,19 @@ def _is_comtypes_variant_ord_typeerror(error: TypeError) -> bool:
 
     return False
 
+
+def _runtime_identity(node: Any) -> Optional[tuple[int, ...]]:
+    """Return a hashable UIA RuntimeId for `node`, or None when none can be read.
+
+    RuntimeId is already part of the tree-traversal cache request, so this reads a
+    value cached in-process instead of issuing another cross-process UIA round-trip.
+    """
+    try:
+        parts = tuple(int(part) for part in node.GetCachedPropertyValue(PropertyId.RuntimeIdProperty))
+    except (TypeError, ValueError, COMError):
+        return None
+    return parts or None
+
 if TYPE_CHECKING:
     from windows_mcp.desktop.service import Desktop
 
@@ -50,11 +105,9 @@ class Tree:
         self.dom:Optional[Control]=None
         self.dom_bounding_box:BoundingBox=None
         self.dom_is_ia2:bool=False
-        self.screen_box=BoundingBox(
-            top=0, left=0, bottom=self.screen_size.height, right=self.screen_size.width,
-            width=self.screen_size.width, height=self.screen_size.height
-        )
+        self.screen_box=desktop.get_screen_box()
         self.tree_state=None
+        self.element_budget=TreeElementBudget(resolve_max_tree_elements())
 
 
     def get_state(self,active_window_handle:int|None,other_windows_handles:list[int],use_dom:bool=False)->TreeState:
@@ -62,6 +115,9 @@ class Tree:
         self.dom = None
         self.dom_bounding_box = None
         self.dom_is_ia2 = False
+        # Fresh budget per capture — huge lists/grids (e.g. thousands of rows) must not
+        # stall UI Automation or blow up the serialized response.
+        self.element_budget = TreeElementBudget(resolve_max_tree_elements())
         start_time = perf_counter()
         profile_enabled = _snapshot_profile_enabled()
 
@@ -133,9 +189,16 @@ class Tree:
         if not status:
             logger.warning(f"[Tree] {len(failed_handles)} window(s) failed to capture — UI services may be loading")
         end_time = perf_counter()
+        if self.element_budget.truncated:
+            logger.warning(
+                "[Tree] Capture truncated at %d elements (limit=%d) — some UI elements were "
+                "not visited. Set WINDOWS_MCP_MAX_TREE_ELEMENTS to raise the limit.",
+                self.element_budget.count,
+                self.element_budget.limit,
+            )
         if profile_enabled:
             logger.info(
-                "Snapshot tree profile: windows=%d active_window=%s interactive_nodes=%d scrollable_nodes=%d dom_nodes=%d failed_windows=%d total_ms=%.1f use_dom=%s",
+                "Snapshot tree profile: windows=%d active_window=%s interactive_nodes=%d scrollable_nodes=%d dom_nodes=%d failed_windows=%d total_ms=%.1f use_dom=%s truncated=%s",
                 len(windows_handles),
                 active_window_handle is not None,
                 len(interactive_nodes),
@@ -144,6 +207,7 @@ class Tree:
                 len(failed_handles),
                 (end_time - start_time) * 1000,
                 use_dom,
+                self.element_budget.truncated,
             )
         logger.info(f"[Tree] Tree State capture took {end_time - start_time:.2f} seconds")
         return TreeState(
@@ -155,6 +219,8 @@ class Tree:
             dom_informative_nodes=dom_informative_nodes,
             capture_sec=end_time - start_time,
             semantic_tree_root=desktop_root,
+            truncated=self.element_budget.truncated,
+            element_limit=self.element_budget.limit,
         )
 
     def get_window_wise_nodes(self,windows_handles:list[int],active_window_flag:bool,use_dom:bool=False) -> tuple[list[TreeElementNode],list[ScrollElementNode],list[TextElementNode],list[int],list[SemanticNode]]:
@@ -165,25 +231,53 @@ class Tree:
         causing cross-apartment marshaling deadlocks when the main thread also does
         COM operations (ControlFromHandle, is_window_browser). Sequential processing
         keeps all UIA COM calls in the main thread's STA.
+
+        Windows whose owning process is listed in ``WINDOWS_MCP_EXCLUDE_PROCESSES``
+        are skipped before any UIA call, so their accessibility providers are never
+        entered. Skipped windows are neither traversed nor reported as failures.
         """
         interactive_nodes, scrollable_nodes, dom_informative_nodes = [], [], []
         failed_handles = []
         window_sem_nodes: list[SemanticNode] = []
 
+        excluded_processes = _excluded_process_names()
         task_inputs = []
         for handle in windows_handles:
+            if excluded_processes:
+                # Resolve the owning process before any UIA call: entering an
+                # excluded provider is the very thing this skip exists to avoid.
+                process_name = _window_process_name(handle)
+                if process_name and process_name.casefold() in excluded_processes:
+                    logger.debug(
+                        "[Tree] Skipping UIA traversal for excluded process %s",
+                        process_name,
+                    )
+                    continue
             is_browser = False
             try:
                 temp_node = ControlFromHandle(handle)
                 if active_window_flag and temp_node.ClassName == "Progman":
                     continue
                 is_browser = self.desktop.is_window_browser(temp_node)
-            except Exception:
-                pass
+            except Exception as e:
+                if is_timeout_exception(e):
+                    logger.warning(
+                        f"Window handle {handle} is not responding to UI Automation; "
+                        f"skipping it for this capture. Error: {e}"
+                    )
+                    failed_handles.append(handle)
+                    continue
             task_inputs.append((handle, is_browser))
 
         retry_counts = {handle: 0 for handle in windows_handles}
         for handle, is_browser in task_inputs:
+            if self.element_budget.exhausted:
+                logger.debug(
+                    "[Tree] Element budget exhausted (%d/%d) — skipping remaining windows",
+                    self.element_budget.count,
+                    self.element_budget.limit,
+                )
+                break
             for attempt in range(THREAD_MAX_RETRIES + 1):
                 try:
                     result = self.get_nodes(handle, is_browser, wait_time=0.5 * (2 ** (attempt - 1)) if attempt > 0 else 0, use_dom=use_dom)
@@ -196,6 +290,15 @@ class Tree:
                             window_sem_nodes.append(win_sem_node)
                     break
                 except Exception as e:
+                    if is_timeout_exception(e):
+                        # The window's UI thread is not answering. Retrying, or even reading
+                        # its Name for the log line, would pay the full timeout again.
+                        logger.warning(
+                            f"Window handle {handle} is not responding to UI Automation; "
+                            f"skipping it for this capture. Error: {e}"
+                        )
+                        failed_handles.append(handle)
+                        break
                     retry_counts[handle] = attempt + 1
                     try:
                         window_name = ControlFromHandle(handle).Name
@@ -228,6 +331,36 @@ class Tree:
                 height=clipped.height()
             )
         return BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0)
+
+    def _append_word_nodes(self, word_elements:list[tuple[str,Rect]], reference_box:Rect, window_name:str,
+                            target_nodes:list[TreeElementNode], current_semantic_node:'Optional[SemanticNode]'=None):
+        """Append one interactive `TreeElementNode` (control_type='Word') per (word, rect) pair."""
+        for word, rect in word_elements:
+            if not self.element_budget.try_consume():
+                break
+            bounding_box = self.iou_bounding_box(reference_box, rect)
+            if bounding_box.width <= 0 or bounding_box.height <= 0:
+                continue
+            center = bounding_box.get_center()
+            word_node = TreeElementNode(**{
+                'name':word,
+                'control_type':'Word',
+                'bounding_box':bounding_box,
+                'center':center,
+                'window_name':window_name,
+                'metadata':{}
+            })
+            target_nodes.append(word_node)
+            if current_semantic_node is not None:
+                current_semantic_node.add_child(SemanticNode(
+                    control_type='Word',
+                    element_type='interactive',
+                    name=word,
+                    window_name=window_name,
+                    center=center,
+                    bounding_box=bounding_box,
+                    metadata={},
+                ))
 
 
 
@@ -330,7 +463,8 @@ class Tree:
                     dom_interactive_nodes:Optional[list[TreeElementNode]]=None, dom_informative_nodes:Optional[list[TextElementNode]]=None,
                     is_dom:bool=False, is_dialog:bool=False,
                     element_cache_req:Optional[Any]=None, children_cache_req:Optional[Any]=None,
-                    current_semantic_node:'Optional[SemanticNode]'=None):
+                    current_semantic_node:'Optional[SemanticNode]'=None,
+                    ancestor_runtime_ids:Optional[frozenset[tuple[int, ...]]]=None):
         try:
             # Build cached control if caching is enabled
             if not hasattr(node, '_is_cached') and element_cache_req:
@@ -341,6 +475,25 @@ class Tree:
             control_type_name = node.CachedControlTypeName
             # class_name = node.CachedClassName
             semantic_added = False
+
+            # A provider can hand back a child whose RuntimeId equals one of its own
+            # ancestors (seen with an expanded Edge <select>), which sends this recursion
+            # around in circles. The element budget cannot catch that: a cyclic pane
+            # appends no output nodes, so it never consumes budget and never trips the
+            # limit — the walk just runs until RecursionError, and Snapshot never returns.
+            # This sits after the property reads above so stale elements keep taking the
+            # established dead-element path instead of failing on a missing accessor.
+            runtime_id = _runtime_identity(node)
+            if runtime_id is not None:
+                if ancestor_runtime_ids is not None and runtime_id in ancestor_runtime_ids:
+                    logger.warning(
+                        "[Tree] Cutting cyclic UIA branch in '%s': element %s repeats an "
+                        "ancestor's RuntimeId",
+                        window_name,
+                        runtime_id,
+                    )
+                    return
+                ancestor_runtime_ids = (ancestor_runtime_ids or frozenset()) | {runtime_id}
 
             # Scrollable check
             if scrollable_nodes is not None:
@@ -362,6 +515,7 @@ class Tree:
                             metadata['vertical_scroll_percent']=round(scroll_pattern.VerticalScrollPercent,2) if scroll_pattern.VerticallyScrollable else 0
 
                             sem_scroll_name = name.strip() or automation_id or localized_control_type.capitalize() or "''"
+                            self.element_budget.try_consume()
                             scrollable_nodes.append(ScrollElementNode(**{
                                 'name':sem_scroll_name,
                                 'control_type':localized_control_type.title(),
@@ -465,6 +619,9 @@ class Tree:
 
                                 if is_role_interactive and (is_default_action or is_keyboard_focusable):
                                     is_interactive = True
+                                
+                        if isinstance(node,DocumentControl):
+                            is_interactive=True
 
                         if is_interactive:
                             is_focused = node.CachedHasKeyboardFocus
@@ -476,6 +633,8 @@ class Tree:
                             metadata['has_focused']=is_focused
                             if accelerator_key:
                                 metadata['shortcut']=accelerator_key
+
+                            word_elements: list[tuple[str, Rect]] = []
 
                             try:
                                 help_text = node.CachedHelpText
@@ -498,20 +657,58 @@ class Tree:
                                 except Exception:
                                     pass
 
-                            if isinstance(node,EditControl):
+                            if isinstance(node,(EditControl,DocumentControl,ImageControl)):
+                                is_password = False
+                                try:
+                                    is_password = bool(node.CachedIsPassword)
+                                    if is_password:
+                                        metadata['is_password']=True
+                                except Exception:
+                                    pass
+
+                                try:
+                                    value = node.GetCachedPropertyValue(PropertyId.LegacyIAccessibleValueProperty)
+                                    metadata['value']=value.strip() if value else '(empty)'
+                                    if not is_password and not is_dom:
+                                        words=node.GetAllWordBoundingBoxes()
+                                        for word,boxes in words:
+                                            for box in boxes:
+                                                word_elements.append((word,box))
+                                except Exception:
+                                    pass
+
+                                # Selection state, reported only when there is a real (non-empty)
+                                # selection — a bare caret is the resting state of every focused
+                                # field and would be noise on every node.
+                                if not is_password:
+                                    try:
+                                        text_pattern = node.GetPattern(PatternId.TextPattern)
+                                        if text_pattern is not None:
+                                            selection = text_pattern.GetSelection()
+                                            if selection:
+                                                selected_range = selection[0]
+                                                selected_text = selected_range.GetText()
+                                                if selected_text:
+                                                    metadata['selected_text'] = selected_text
+                                                    document_range = text_pattern.DocumentRange
+                                                    starts_at_doc_start = selected_range.CompareEndpoints(
+                                                        TextPatternRangeEndpoint.Start, document_range, TextPatternRangeEndpoint.Start
+                                                    ) == 0
+                                                    ends_at_doc_end = selected_range.CompareEndpoints(
+                                                        TextPatternRangeEndpoint.End, document_range, TextPatternRangeEndpoint.End
+                                                    ) == 0
+                                                    if starts_at_doc_start and ends_at_doc_end:
+                                                        metadata['all_selected'] = True
+                                    except Exception:
+                                        pass
+
+                            if isinstance(node,ComboBoxControl):
                                 try:
                                     value = node.GetCachedPropertyValue(PropertyId.LegacyIAccessibleValueProperty)
                                     metadata['value']=value.strip() if value else '(empty)'
                                 except Exception:
                                     pass
-
-                                try:
-                                    if node.CachedIsPassword:
-                                        metadata['is_password']=True
-                                except Exception:
-                                    pass
-
-                            if isinstance(node,ComboBoxControl):
+                                
                                 try:
                                     control_state=node.GetCachedPropertyValue(PropertyId.ExpandCollapseExpandCollapseStateProperty)
                                     match control_state:
@@ -578,8 +775,10 @@ class Tree:
                                     'window_name':window_name,
                                     'metadata':metadata
                                 })
+                                self.element_budget.try_consume()
                                 dom_interactive_nodes.append(tree_node)
                                 self._dom_correction(node, dom_interactive_nodes, window_name)
+                                self._append_word_nodes(word_elements, self.dom_bounding_box, window_name, dom_interactive_nodes)
                             else:
                                 bounding_box=self.iou_bounding_box(window_bounding_box,element_bounding_box)
                                 center = bounding_box.get_center()
@@ -592,18 +791,20 @@ class Tree:
                                         'window_name':window_name,
                                         'metadata':metadata
                                     })
+                                    self.element_budget.try_consume()
                                     interactive_nodes.append(tree_node)
-                                if current_semantic_node is not None:
-                                    current_semantic_node.add_child(SemanticNode(
-                                        control_type=tree_node.control_type,
-                                        element_type='interactive',
-                                        name=tree_node.name,
-                                        window_name=tree_node.window_name,
-                                        center=tree_node.center,
-                                        bounding_box=tree_node.bounding_box,
-                                        metadata=dict(tree_node.metadata),
-                                    ))
-                                    semantic_added = True
+                                    if current_semantic_node is not None:
+                                        current_semantic_node.add_child(SemanticNode(
+                                            control_type=tree_node.control_type,
+                                            element_type='interactive',
+                                            name=tree_node.name,
+                                            window_name=tree_node.window_name,
+                                            center=tree_node.center,
+                                            bounding_box=tree_node.bounding_box,
+                                            metadata=dict(tree_node.metadata),
+                                        ))
+                                        semantic_added = True
+                                self._append_word_nodes(word_elements, window_bounding_box, window_name, interactive_nodes, current_semantic_node)
 
                     # Informative Check
                     if dom_informative_nodes is not None:
@@ -629,6 +830,7 @@ class Tree:
                          if is_text:
                              if is_browser and is_dom:
                                  name = node.CachedName
+                                 self.element_budget.try_consume()
                                  dom_informative_nodes.append(TextElementNode(
                                      text=name.strip(),
                                  ))
@@ -656,6 +858,11 @@ class Tree:
 
             # Recursively traverse the tree the right to left for normal apps and for DOM traverse from left to right
             for child in (children if is_dom else reversed(children)):
+                if self.element_budget.exhausted:
+                    # Stop descending once the element budget is spent — this is what
+                    # bounds traversal time on huge flat lists/grids (thousands of rows),
+                    # not just the size of the appended node lists.
+                    break
                 try:
                     # Check if the child is a DOM element
                     if is_browser and child.CachedAutomationId=="RootWebArea":
@@ -665,7 +872,7 @@ class Tree:
                         height=bounding_box.height())
                         self.dom=child
                         # enter DOM subtree
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=True, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=None)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=True, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=None, ancestor_runtime_ids=ancestor_runtime_ids)
                     # Check if the child is a dialog
                     elif isinstance(child,WindowControl):
                         if not child.CachedIsOffscreen:
@@ -685,10 +892,10 @@ class Tree:
                                 if is_modal:
                                     interactive_nodes.clear()
                         # enter dialog subtree
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=True, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=True, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent, ancestor_runtime_ids=ancestor_runtime_ids)
                     else:
                         # normal non-dialog children
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent, ancestor_runtime_ids=ancestor_runtime_ids)
                 except TypeError as e:
                     if not _is_comtypes_variant_ord_typeerror(e):
                         raise
@@ -710,6 +917,9 @@ class Tree:
                 e,
             )
         except Exception as e:
+            if is_uia_dead_element_error(e):
+                logger.debug("Skipping dead UIA subtree in '%s': %s", window_name, e)
+                return
             logger.error(f"Error in tree_traversal: {e}", exc_info=True)
             raise
 
@@ -777,8 +987,21 @@ class Tree:
                     )
                     ia2_ms = (perf_counter() - ia2_t0) * 1000
                     if ia2_result:
-                        dom_interactive_nodes.extend(ia2_result.interactive_nodes)
-                        dom_informative_nodes.extend(ia2_result.informative_nodes)
+                        # traverse_window() already walked the whole IAccessible tree before
+                        # returning, so this can't bound traversal time — but it still caps
+                        # how much of the result gets appended/serialized.
+                        remaining = self.element_budget.remaining
+                        capped_interactive = ia2_result.interactive_nodes[:remaining]
+                        remaining_after_interactive = max(0, remaining - len(capped_interactive))
+                        capped_informative = ia2_result.informative_nodes[:remaining_after_interactive]
+                        if (
+                            len(capped_interactive) < len(ia2_result.interactive_nodes)
+                            or len(capped_informative) < len(ia2_result.informative_nodes)
+                        ):
+                            self.element_budget.truncated = True
+                        self.element_budget.try_consume(len(capped_interactive) + len(capped_informative))
+                        dom_interactive_nodes.extend(capped_interactive)
+                        dom_informative_nodes.extend(capped_informative)
                         # Pin the bbox to the FIRST Firefox window walked (the active
                         # one — it's first in windows_handles). Subsequent windows
                         # contribute nodes but mustn't clobber the active window's bbox.

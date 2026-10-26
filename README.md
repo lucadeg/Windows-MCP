@@ -1,14 +1,15 @@
-[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cursortouch-windows-mcp-badge.png)](https://mseep.ai/app/cursortouch-windows-mcp)
-
 <div align="center">
   <h1>🪟 Windows-MCP</h1>
 
-  <a href="https://github.com/CursorTouch/Windows-MCP/blob/main/LICENSE">
+  <a href="https://github.com/CursorTouch/Windows-MCP/blob/main/LICENSE.md">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   </a>
-  <img src="https://img.shields.io/badge/python-3.13%2B-blue" alt="Python">
-  <img src="https://img.shields.io/badge/platform-Windows%207–11-blue" alt="Platform: Windows 7 to 11">
+  <img src="https://img.shields.io/badge/python-3.14%2B-blue" alt="Python">
+  <img src="https://img.shields.io/badge/platform-Windows%2010–11-blue" alt="Platform: Windows 10 and 11">
   <img src="https://img.shields.io/github/last-commit/CursorTouch/Windows-MCP" alt="Last Commit">
+  <a href="https://pepy.tech/projects/windows-mcp">
+    <img src="https://static.pepy.tech/personalized-badge/windows-mcp?period=total&amp;units=INTERNATIONAL_SYSTEM&amp;left_color=BLACK&amp;right_color=GREEN&amp;left_text=downloads" alt="PyPI Downloads">
+  </a>
   <br>
   <a href="https://x.com/CursorTouch">
     <img src="https://img.shields.io/badge/follow-%40CursorTouch-1DA1F2?logo=twitter&style=flat" alt="Follow on Twitter">
@@ -17,9 +18,9 @@
     <img src="https://img.shields.io/badge/Join%20on-Discord-5865F2?logo=discord&logoColor=white&style=flat" alt="Join us on Discord">
   </a>
 
-</div>
+  <a href="https://trendshift.io/repositories/20935?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-20935" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/20935/daily?language=Python" alt="CursorTouch%2FWindows-MCP | Trendshift" width="250" height="55"/></a>
 
-<br>
+</div>
 
 **Windows-MCP** is a lightweight, open-source project that enables seamless integration between AI agents and the Windows operating system. Acting as an MCP server bridges the gap between LLMs and the Windows operating system, allowing agents to perform tasks such as **file navigation, application control, UI interaction, QA testing,** and more.
 
@@ -33,10 +34,10 @@ mcp-name: io.github.CursorTouch/Windows-MCP
 
 ### Supported Operating Systems
 
-- Windows 7
-- Windows 8, 8.1
 - Windows 10
-- Windows 11  
+- Windows 11
+
+The current package requires Python 3.14+, which [supports Windows 10 and newer](https://docs.python.org/3.14/using/windows.html#supported-versions). Earlier Windows versions are not supported by the current installation.
 
 ## 🎥 Demos
 
@@ -73,9 +74,9 @@ mcp-name: io.github.CursorTouch/Windows-MCP
 
 ### Prerequisites
 
-- Python 3.13+
+- Python 3.14+
 - UV (Package Manager) from Astra, install with `pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- `English` as the default language in Windows preferred else disable the `App-Tool` in the MCP Server for Windows with other languages.
+- The `App` tool resolves localized Start Menu display names as well as internal app names; an English Windows display language is not required.
 
 ### Run at Login
 
@@ -341,6 +342,18 @@ args=[
 </details>
 
 <details>
+  <summary>Install in Autohand Code</summary>
+
+  Add the published stdio server from a Windows terminal:
+
+  ```shell
+  autohand mcp add windows-mcp uvx windows-mcp serve
+  ```
+
+  Add `--scope project` after `add` to keep the server configuration in the current project. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
+</details>
+
+<details>
   <summary>Install in Claude Code</summary>
 
   1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview):
@@ -586,6 +599,84 @@ openssl req -x509 -newkey rsa:4096 \
   -days 365 -nodes
 ```
 
+### Desktop control
+
+Desktop control is enabled by default with the **relaxed** policy: direct desktop
+actions are gated, while background tools can run as you use the computer.
+Configure it in `~/.windows-mcp/config.toml` (or disable it entirely with `enabled = false`):
+
+```toml
+[control]
+enabled = true
+policy = "relaxed"
+idle_timeout_seconds = 10.0
+```
+
+Or override it for one MCP server launch:
+
+```shell
+windows-mcp serve --no-control
+windows-mcp serve --control --control-idle-timeout 3
+windows-mcp serve --control-policy strict
+```
+
+In your MCP client's launch arguments, put these options after `serve`.
+The priority is CLI > environment variable > TOML > default. `--control` can
+explicitly override `enabled = false`. The timeout accepts finite positive seconds
+(including fractions); zero does not disable control. The default remains 10 seconds.
+
+Restart the Windows-MCP server process after changing these settings. There is no
+hot reload or AI configuration tool. `ControlStatus` reports the effective `enabled`
+`policy`, and `idle_timeout_seconds` values, with state `disabled` when control is off.
+
+Disabling control turns off ownership gating, physical input protection, takeover
+monitoring, and the control indicator. Tools remain available and serialized, with
+injected key/button cleanup retained. AI desktop actions can then interfere with your
+own input; PowerShell scripts can also operate the UI. The separate screenshot flash
+setting is unchanged. When control is enabled, the idle timer restarts with physical
+input, so shortening it does not allow gated calls while you keep using the computer.
+
+During AI control, small mouse movements remain blocked without pausing the current
+tool. Mouse takeover adds up the length of each relative raw-input movement,
+including back-and-forth movement, until it reaches 500 device units by default.
+A gap of 0.5 seconds without movement starts a new segment; switching devices or
+starting a new control period also clears the total. Set `control.mouse_takeover_units`
+in TOML to change the threshold (40–2000), then restart the server. These are device
+units, not screen pixels. Devices that do not provide identifiable relative raw
+input, including some touchpads and remote-input devices, must use
+`Ctrl+Alt+Shift+Backspace` to take over. The legacy `mouse_takeover_pixels` setting
+is still accepted for compatibility but no longer affects takeover.
+
+### Desktop gate policies
+
+| Policy | Operations that require desktop ownership |
+|---|---|
+| `relaxed` (A, default) | Direct input: Click, Type, Scroll, Move, Shortcut, MultiSelect, MultiEdit; App `switch` and `resize`. |
+| `balanced` (B) | Everything in A, plus PowerShell, Notification, App `launch`/`launch_executable`, Process `kill`, and Clipboard `set`. |
+| `strict` (C) | All tools except ControlStatus, matching the previous gate behavior. |
+
+FileSystem, Registry, Snapshot, Screenshot, Scrape, Wait, WaitFor, DisplayInventory,
+Process `list`, and Clipboard `get` bypass ownership in A and B. This classification
+concerns desktop interference, not permissions or data safety. PowerShell can still
+operate the UI, and file/registry operations can have other side effects.
+
+Ungated calls do not acquire or extend the desktop lease, activate its indicator,
+or wait for its tool lock. Existing resource constraints still apply: UI Automation
+operations share a dedicated worker, so a long WaitFor can delay other UIA work.
+The separate screenshot flash is unchanged. `--no-control` retains its existing
+all-tools serialization and overrides the policy's ownership checks.
+
+In relaxed mode, agents should prefer background work and coordinate known desktop
+interference with the user. Obtain permission before knowingly disrupting a user's
+process or taking focus, reusing existing authorization. These are tool-use guidelines,
+not server-enforced approval or process ownership tracking. Clipboard continues to
+use the real Windows clipboard; no virtual clipboard is introduced.
+
+For contributors: tool categories and the few mode-specific exceptions live in
+`src/windows_mcp/tools/control_policy.py`. Update that table when adding tools or modes;
+registration coverage tests detect omissions. Unknown extensions conservatively
+use the gate. Keep policy decisions out of individual tool implementations.
+
 ### `auth` Helper
 
 Generate an auth key and save a working config to `~/.windows-mcp/config.toml`:
@@ -620,6 +711,50 @@ All variables are optional unless noted. Set them via the `env` key in `claude_d
 | `WINDOWS_MCP_PROFILE_SNAPSHOT` | _(disabled)_ | Set to `1`, `true`, `yes`, or `on` to emit per-stage timing logs for Screenshot/Snapshot calls. Useful for diagnosing slow captures. |
 | `WINDOWS_MCP_DISABLE_FLASH` | _(disabled)_ | Set to `1`, `true`, `yes`, or `on` to suppress the orange-red glowing border that briefly highlights the captured area after every screenshot. The flash is rendered on a transparent always-on-top window *after* capture so it never appears in the captured image. |
 
+### Excluding processes from UI Automation traversal
+
+| Variable | Default | Description |
+|---|---|---|
+| `WINDOWS_MCP_EXCLUDE_PROCESSES` | _(none)_ | Comma-separated process basenames whose windows are excluded from UI Automation tree traversal, e.g. `Code.exe,Cursor.exe`. Matching is case-insensitive and exact — no wildcards or regular expressions. Unset or empty preserves current behaviour. |
+
+Some applications expose accessibility trees that can become slow or unresponsive during UI Automation traversal. `Snapshot` and `WaitFor` may traverse the active window and other top-level handles selected for tree capture, so one pathological accessibility provider can stall the capture.
+
+Set:
+
+```text
+WINDOWS_MCP_EXCLUDE_PROCESSES=Code.exe,Cursor.exe
+```
+
+Process names are comma-separated executable basenames. They are matched case-insensitively after surrounding whitespace is stripped; empty entries are ignored and duplicates are harmless.
+
+A window is excluded *before* any UI Automation call is made against it, so its accessibility provider is never entered. Excluded applications may still appear in the window list, but Windows-MCP will not traverse their accessibility trees, and they are not reported as failed captures. If the owning process of a window cannot be resolved, the window is traversed as usual.
+
+This is an exclusion mechanism — a mitigation, not a complete fix for every form of [#383](https://github.com/CursorTouch/Windows-MCP/issues/383). It only skips the processes you name; a pathological window you have not listed can still stall a capture.
+
+### UI Automation timeouts
+
+| Variable | Default | Description |
+|---|---|---|
+| `WINDOWS_MCP_UIA_CONNECTION_TIMEOUT_MS` | `2000` | Milliseconds UI Automation waits to connect to a window's accessibility provider before failing that window. Positive integer; anything else uses the default. |
+| `WINDOWS_MCP_UIA_TRANSACTION_TIMEOUT_MS` | `5000` | Milliseconds a single UI Automation call into a provider may take before it fails. Positive integer; anything else uses the default. |
+
+When a window stops answering UI Automation (its UI thread is busy, deadlocked, or still starting up), `Snapshot`, `WaitFor` and other UI-tree tools now skip that window after one timeout. The window is reported as a failed capture, and the rest of the desktop is still returned. Previously the call waited until the window recovered, and every later tool call queued behind it. Raise these values only if an application legitimately needs longer for a single accessibility call. To stop traversing an application at all, use `WINDOWS_MCP_EXCLUDE_PROCESSES`.
+
+### Desktop control settings
+
+If a physical key/button release event is missed, the input monitor checks residual
+holds after the configured idle wait. Five consecutive all-released samples, at
+least 100 ms apart, clear the stale records. New physical input or a reported held
+key/button resets confirmation. This is best-effort: a zero `GetAsyncKeyState`
+result counts as released even when Windows cannot provide the state; repeated
+sampling filters transient readings but cannot distinguish persistent query failure.
+
+| Variable | Default | Description |
+|---|---|---|
+| `WINDOWS_MCP_CONTROL` | `true` | Enable desktop control coordination. Set to `false` to disable. Equivalent to `--control/--no-control`; restart required. |
+| `WINDOWS_MCP_CONTROL_POLICY` | `relaxed` | Gate policy: `relaxed`, `balanced`, or `strict`. Equivalent to `--control-policy`; restart required. |
+| `WINDOWS_MCP_CONTROL_IDLE_TIMEOUT` | `10.0` | Finite positive idle wait in seconds. Equivalent to `--control-idle-timeout`; restart required. |
+
 ### Security
 
 | Variable | Default | Description |
@@ -635,6 +770,8 @@ All variables are optional unless noted. Set them via the `env` key in `claude_d
 | `WINDOWS_MCP_OAUTH_CLIENT_SECRET` | _(none)_ | OAuth client secret for HTTP transports. Must be provided with `WINDOWS_MCP_OAUTH_CLIENT_ID`. |
 | `WINDOWS_MCP_STATELESS_HTTP` | `false` | Set to `1`, `true`, `yes`, or `on` to run `streamable-http` without `Mcp-Session-Id` connection state. Useful for reconnects after restarts and for horizontally scaled deployments. |
 
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cursortouch-windows-mcp-badge.png)](https://mseep.ai/app/cursortouch-windows-mcp)
+
 ### Telemetry
 
 | Variable | Default | Description |
@@ -648,6 +785,12 @@ All variables are optional unless noted. Set them via the `env` key in `claude_d
 | Variable | Default | Description |
 |---|---|---|
 | `WINDOWS_MCP_DEBUG` | `false` | Set to `1`, `true`, `yes`, or `on` to enable debug mode, which sets the log level to DEBUG for verbose output. Also available as the `--debug` CLI flag. |
+
+### WatchDog
+
+| Variable | Default | Description |
+|---|---|---|
+| `WINDOWS_MCP_WATCHDOG` | `false` | Set to `on`, `1`, `true`, `yes`, or `enabled` (case-insensitive) to run the UIA focus watchdog. It is off by default because its only remaining effect is debug logging of focus changes, while it costs a background thread and a long-lived UIA event subscription that can crash the server on unstable UIA environments after long uptime (e.g. across a sleep/resume or session change). The accessibility tree is built on demand for every tool call either way, so tool behaviour is unaffected. |
 
 **Example `claude_desktop_config.json`:**
 
@@ -691,13 +834,19 @@ MCP Client can access the following tools to interact with Windows:
 - `Click`: Click on the screen at the given coordinates.
 - `Type`: Type text on an element (optionally clears existing text).
 - `Scroll`: Scroll vertically or horizontally on the window or specific regions.
-- `Move`: Move mouse pointer or drag (set drag=True) to coordinates.
+- `Move`: Move mouse pointer or drag (set drag=True) to coordinates. For deterministic
+  drag, set `from_loc=[x, y]` with `drag=True` to press at an explicit start point and
+  release at `loc` in one tool call. Optional `duration` adds bounded intermediate
+  movement.
 - `Shortcut`: Press keyboard shortcuts (`Ctrl+c`, `Alt+Tab`, etc).
 - `Wait`: Pause for a defined duration.
 - `WaitFor`: Wait until text, an active window, an element, or a focused element appears by polling UI state inside one tool call.
-- `Screenshot`: Fast screenshot-first desktop capture with cursor position, active/open windows, and an image. Skips UI tree extraction for speed and should be the default first call when you mainly need visual context. Supports `display=[0]` or `display=[0,1]` to capture specific screens. After capture, a brief orange-red glowing border is drawn over the captured area as a visual confirmation (set `WINDOWS_MCP_DISABLE_FLASH=1` to disable).
-- `Snapshot`: Full desktop state capture for workflows that need interactive element ids, scrollable regions, or `use_dom=True` browser extraction. Supports `use_vision=True` for including screenshots and `display=[0]` or `display=[0,1]` for limiting all returned Snapshot information to specific screens.
-- `App`: To launch an application from the start menu, resize or move the window and switch between apps.
+- `ControlStatus`: Read the desktop control owner and remaining user-idle wait. It stays available when user takeover blocks new tool calls. During AI control, a visible edge and cursor glow indicate ownership; moving the physical mouse substantially or pressing `Ctrl+Alt+Shift+Backspace` returns control to the user until 10 seconds of inactivity. During screenshot capture, the indicator is temporarily hidden and physical input is released; any physical input during this interval preempts AI control, although `ControlStatus` can briefly still report `ai` until that event is processed. Stepwise desktop input stops at its next checkpoint, but an already-running external command (for example `PowerShell` or an `App` launch) may continue after takeover; this control gate does not cancel processes or undo completed side effects. On a detected hook fault, injected keys and mouse buttons are released asynchronously, so physical input can briefly overlap a still-held AI key or button. Windows may also silently remove a low-level hook without notifying this process; periodic hook replacement reduces but does not eliminate that undetected window. User takeover is therefore best-effort, not a security boundary or a guarantee of exclusive control.
+  Sessionless MCP 2026-07-28 clients cannot receive unsolicited control-state logs; they should query `ControlStatus` when they need the current owner.
+- `DisplayInventory`: Read display layout, work areas, effective DPI, and scale metadata.
+- `Screenshot`: Fast screenshot-first desktop capture with cursor position, active/open windows, and an image. Skips UI tree extraction for speed and should be the default first call when you mainly need visual context. Supports `display=[0]` or `display=[0,1]` using zero-based active Windows display indices, and `region=[left, top, right, bottom]` (virtual-desktop pixel coordinates) to capture just that rectangle instead of the whole screen — cheaper on tokens when you already know which area matters. `region` takes precedence over `display` when both are given; an invalid or out-of-bounds region raises an error. After capture, a brief orange-red glowing border is drawn inside the captured area as a visual confirmation (set `WINDOWS_MCP_DISABLE_FLASH=1` to disable).
+- `Snapshot`: Full desktop state capture for workflows that need interactive element ids, scrollable regions, or `use_dom=True` browser extraction. Supports `use_vision=True` for including screenshots, `display=[0]` or `display=[0,1]` using zero-based active Windows display indices, and `region=[left, top, right, bottom]` (virtual-desktop pixel coordinates) to inspect just that rectangle instead of the whole screen; `region` takes precedence over `display` when both are given, and an invalid or out-of-bounds region raises an error.
+- `App`: Launch an application by Start Menu name or strictly by executable path with separated argv and optional cwd; resize, move, and switch between windows.
 - `PowerShell`: To execute PowerShell commands.
 - `FileSystem`: Read, write, copy, move, delete, list, search, and inspect files and directories.
 - `Scrape`: To scrape the entire webpage for information.
@@ -705,8 +854,32 @@ MCP Client can access the following tools to interact with Windows:
 - `MultiEdit`: Enter text into multiple input fields at specified coordinates. Uses bulk label-to-coordinate resolution when labels are provided.
 - `Clipboard`: Read or set Windows clipboard content.
 - `Process`: List running processes or terminate them by PID or name.
-- `Notification`: Send a Windows toast notification with a title and message.
+- `Notification`: Send a Windows toast notification with `title`, `message`, and a required `app_id` (registered Windows AppUserModelID). See the example below.
 - `Registry`: Read, write, delete, or list Windows Registry values and keys.
+
+### Toast notifications
+
+`Notification` requires a registered Windows AppUserModelID in `app_id`, in addition
+to `title` and `message`. Windows attributes the toast to that app. To find IDs
+registered on the target machine, run this in PowerShell (or via the `PowerShell` tool):
+
+```powershell
+Get-StartApps | Select-Object Name, AppID
+```
+
+Use the `AppID` value, not the app's display name. For example, if the list includes
+`Microsoft.Windows.Explorer`, an MCP tool call is:
+
+```json
+{
+  "name": "Notification",
+  "arguments": {
+    "title": "Windows-MCP",
+    "message": "Task complete",
+    "app_id": "Microsoft.Windows.Explorer"
+  }
+}
+```
 
 
 ## 🤝 Connect with Us
@@ -718,7 +891,7 @@ Stay updated and join our community:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=CursorTouch/Windows-MCP&type=Date)](https://www.star-history.com/#CursorTouch/Windows-MCP&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=CursorTouch/Windows-MCP&type=Date)](https://star-history.dera.page/#CursorTouch/Windows-MCP&Date)
 
 ## 👥 Contributors
 
@@ -728,7 +901,7 @@ Thanks to all the amazing people who have contributed to Windows-MCP! 🎉
   <img src="https://contrib.rocks/image?repo=CursorTouch/Windows-MCP" />
 </a>
 
-We appreciate every contribution, whether it's code, documentation, bug reports, or feature suggestions. Want to contribute? Check out our [Contributing Guidelines](CONTRIBUTING)!
+We appreciate every contribution, whether it's code, documentation, bug reports, or feature suggestions. Want to contribute? Check out our [Contributing Guidelines](CONTRIBUTING.md)!
 
 ## 🔒 Security
 
@@ -777,7 +950,7 @@ For detailed information on what data is collected and how it is handled, please
 
 ## 🪪 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
 
 ## 🙏 Acknowledgements
 
@@ -789,7 +962,7 @@ Huge thanks to the maintainers and contributors of these libraries for their out
 
 ## 🤝Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING](CONTRIBUTING) for setup instructions and development guidelines.
+Contributions are welcome! Please see [CONTRIBUTING](CONTRIBUTING.md) for setup instructions and development guidelines.
 
 Made with ❤️ by [CursorTouch](https://github.com/CursorTouch)
 

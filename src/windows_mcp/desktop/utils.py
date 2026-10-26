@@ -9,8 +9,39 @@ from win32com.shell import shell
 __all__ = [
     "resolve_known_folder_guid_path",
     "remove_private_use_chars",
+    "repair_surrogates",
     "is_elevated",
+    "as_bool",
 ]
+
+
+def as_bool(value: bool | str, name: str) -> bool:
+    """Parse a tool argument declared as ``boolean | string`` into a bool.
+
+    Claude Desktop strips anyOf schemas, so a caller may send "true" where the
+    schema says true. Only the two literals are accepted: anything else raises
+    rather than defaulting to false, so a typo or a plausible-looking "yes"
+    cannot silently turn a requested action into a no-op.
+
+    Args:
+        value: The raw argument value.
+        name: Parameter name, used in the error message.
+
+    Returns:
+        The parsed boolean.
+
+    Raises:
+        ValueError: If *value* is neither a bool nor "true"/"false".
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{name} must be true or false")
 
 
 def is_elevated() -> bool:
@@ -70,3 +101,38 @@ _PRIVATE_USE_RE = re.compile(
 def remove_private_use_chars(text: str) -> str:
     """Remove Unicode Private Use Area characters that may cause rendering issues."""
     return _PRIVATE_USE_RE.sub('', text)
+
+
+_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+
+
+def repair_surrogates(text: str) -> str:
+    """Combine UTF-16 surrogate pairs into real characters, replacing unpaired ones.
+
+    UIA hands back UTF-16 text, and an astral character such as an emoji can
+    arrive as its raw surrogate pair (U+1F437 as U+D83D U+DC37) instead of a
+    single code point. Python keeps those surrogates in the str quite happily,
+    but encoding one to UTF-8 raises UnicodeEncodeError -- so the whole tool
+    response fails to serialize and the caller gets nothing back at all, over a
+    single emoji in somebody's window title.
+
+    Pair up what can be paired, and replace what cannot with U+FFFD, so a stray
+    half-character costs one glyph rather than the entire snapshot.
+    """
+    if not _SURROGATE_RE.search(text):
+        return text
+
+    out: list[str] = []
+    i = 0
+    end = len(text)
+    while i < end:
+        code = ord(text[i])
+        if 0xD800 <= code <= 0xDBFF and i + 1 < end:
+            low = ord(text[i + 1])
+            if 0xDC00 <= low <= 0xDFFF:
+                out.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
+                i += 2
+                continue
+        out.append('\ufffd' if 0xD800 <= code <= 0xDFFF else text[i])
+        i += 1
+    return ''.join(out)

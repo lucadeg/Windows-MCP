@@ -122,6 +122,54 @@ class TestMovePath:
 
 
 class TestDeletePath:
+    @pytest.mark.parametrize("recursive", [False, True])
+    @pytest.mark.parametrize("kind", ["file", "directory", "dangling"])
+    def test_delete_symlink_preserves_target(self, tmp_path, recursive, kind):
+        target = tmp_path / "target"
+        if kind == "file":
+            target.write_text("keep me", encoding="utf-8")
+        elif kind == "directory":
+            target.mkdir()
+            (target / "child.txt").write_text("keep me", encoding="utf-8")
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(target, target_is_directory=kind == "directory")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Creating symbolic links requires Windows privileges")
+            raise
+
+        result = delete_path(str(link), recursive=recursive)
+
+        assert "Deleted file" in result
+        assert not link.is_symlink()
+        if kind == "file":
+            assert target.read_text(encoding="utf-8") == "keep me"
+        elif kind == "directory":
+            assert (target / "child.txt").read_text(encoding="utf-8") == "keep me"
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
+    @pytest.mark.parametrize("recursive", [False, True])
+    @pytest.mark.parametrize("dangling", [False, True])
+    def test_delete_junction_preserves_target(self, tmp_path, recursive, dangling):
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        _winapi.CreateJunction(str(target), str(link))
+        if dangling:
+            target.rmdir()
+        else:
+            (target / "child.txt").write_text("keep me", encoding="utf-8")
+
+        result = delete_path(str(link), recursive=recursive)
+
+        assert "Deleted directory" in result
+        assert not link.is_junction()
+        if not dangling:
+            assert (target / "child.txt").read_text(encoding="utf-8") == "keep me"
+
     def test_delete_file(self, tmp_path):
         f = tmp_path / "del.txt"
         f.write_text("bye", encoding="utf-8")
@@ -158,6 +206,32 @@ class TestDeletePath:
 
 
 class TestListDirectory:
+    @pytest.mark.parametrize("pattern", [None, "*.txt"])
+    @pytest.mark.parametrize("show_hidden", [False, True])
+    def test_recursive_hidden_ancestors(self, tmp_path, pattern, show_hidden):
+        hidden = tmp_path / ".hidden" / "nested"
+        hidden.mkdir(parents=True)
+        (hidden / "secret.txt").write_text("hidden", encoding="utf-8")
+        visible = tmp_path / "visible"
+        visible.mkdir()
+        (visible / "public.txt").write_text("visible", encoding="utf-8")
+        (visible / ".private.txt").write_text("hidden", encoding="utf-8")
+
+        result = list_directory(
+            str(tmp_path), pattern=pattern, recursive=True, show_hidden=show_hidden
+        )
+
+        assert "public.txt" in result
+        assert ("secret.txt" in result) is show_hidden
+        assert (".private.txt" in result) is show_hidden
+
+    def test_recursive_listing_inside_explicit_hidden_root(self, tmp_path):
+        root = tmp_path / ".config"
+        root.mkdir()
+        (root / "settings.txt").write_text("visible", encoding="utf-8")
+
+        assert "settings.txt" in list_directory(str(root), recursive=True)
+
     def test_list_basic(self, tmp_path):
         (tmp_path / "a.txt").write_text("a", encoding="utf-8")
         (tmp_path / "b.txt").write_text("b", encoding="utf-8")

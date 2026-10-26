@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 import logging
 import os
+from _ctypes import COMError
 
 from PIL import Image, ImageGrab
 
@@ -21,6 +23,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DxcamOutput:
+    device_idx: int
+    output_idx: int
+    rect: uia.Rect
 
 
 def _build_crop_box(capture_rect: uia.Rect, padding: int = 0) -> tuple[int, int, int, int]:
@@ -99,28 +108,72 @@ class _DxcamBackend(_ScreenshotBackend):
     priority = 10
 
     def __init__(self) -> None:
-        self._camera_cache: dict[int, object] = {}
+        self._camera_cache: dict[tuple[int, int], object] = {}
 
     @staticmethod
+    def _iter_outputs() -> list[DxcamOutput]:
+        if dxcam is None:
+            return []
+
+        factory = getattr(dxcam, "__factory", None)
+        if factory is None:
+            return []
+
+        outputs: list[DxcamOutput] = []
+        for device_idx, device_outputs in enumerate(getattr(factory, "outputs", [])):
+            for output_idx, output in enumerate(device_outputs):
+                try:
+                    output.update_desc()
+                    coordinates = output.desc.DesktopCoordinates
+                    if not output.attached_to_desktop:
+                        continue
+                except (AttributeError, OSError, RuntimeError, ValueError, COMError):
+                    logger.debug(
+                        "Failed to read DXGI output geometry for device=%s output=%s",
+                        device_idx,
+                        output_idx,
+                        exc_info=True,
+                    )
+                    continue
+                outputs.append(
+                    DxcamOutput(
+                        device_idx=device_idx,
+                        output_idx=output_idx,
+                        rect=uia.Rect(
+                            coordinates.left,
+                            coordinates.top,
+                            coordinates.right,
+                            coordinates.bottom,
+                        ),
+                    )
+                )
+        return outputs
+
+    @classmethod
     def _resolve_region(
+        cls,
         capture_rect: uia.Rect,
-    ) -> tuple[int, tuple[int, int, int, int] | None] | None:
-        """Return ``(output_idx, region)`` if *capture_rect* fits one monitor, else ``None``."""
-        monitor_rects = uia.GetMonitorsRect()
-        for output_idx, monitor_rect in enumerate(monitor_rects):
+    ) -> tuple[int, int, tuple[int, int, int, int] | None] | None:
+        """Return ``(device_idx, output_idx, region)`` when one DXGI output contains the rect."""
+        for output in cls._iter_outputs():
+            output_rect = output.rect
             if (
-                monitor_rect.left <= capture_rect.left
-                and monitor_rect.top <= capture_rect.top
-                and monitor_rect.right >= capture_rect.right
-                and monitor_rect.bottom >= capture_rect.bottom
+                output_rect.left <= capture_rect.left
+                and output_rect.top <= capture_rect.top
+                and output_rect.right >= capture_rect.right
+                and output_rect.bottom >= capture_rect.bottom
             ):
-                if monitor_rect == capture_rect:
-                    return output_idx, None
-                return output_idx, (
-                    capture_rect.left - monitor_rect.left,
-                    capture_rect.top - monitor_rect.top,
-                    capture_rect.right - monitor_rect.left,
-                    capture_rect.bottom - monitor_rect.top,
+                if output_rect == capture_rect:
+                    return output.device_idx, output.output_idx, None
+                return (
+                    output.device_idx,
+                    output.output_idx,
+                    (
+                        capture_rect.left - output_rect.left,
+                        capture_rect.top - output_rect.top,
+                        capture_rect.right - output_rect.left,
+                        capture_rect.bottom - output_rect.top,
+                    ),
                 )
         return None
 
@@ -131,11 +184,16 @@ class _DxcamBackend(_ScreenshotBackend):
             return False
         return self._resolve_region(capture_rect) is not None
 
-    def _get_camera(self, output_idx: int) -> object:
-        camera = self._camera_cache.get(output_idx)
+    def _get_camera(self, device_idx: int, output_idx: int) -> object:
+        camera_key = (device_idx, output_idx)
+        camera = self._camera_cache.get(camera_key)
         if camera is None:
-            camera = dxcam.create(output_idx=output_idx, processor_backend="numpy")
-            self._camera_cache[output_idx] = camera
+            camera = dxcam.create(
+                device_idx=device_idx,
+                output_idx=output_idx,
+                processor_backend="numpy",
+            )
+            self._camera_cache[camera_key] = camera
         return camera
 
     def capture(self, capture_rect: uia.Rect | None) -> Image.Image:
@@ -144,8 +202,8 @@ class _DxcamBackend(_ScreenshotBackend):
             raise ValueError(
                 "DXGI capture supports only regions fully contained within one display"
             )
-        output_idx, region = resolved
-        camera = self._get_camera(output_idx)
+        device_idx, output_idx, region = resolved
+        camera = self._get_camera(device_idx, output_idx)
         frame = camera.grab(region=region, copy=True, new_frame_only=False)
         if frame is None:
             raise RuntimeError("DXGI capture returned no frame")
@@ -219,6 +277,13 @@ class _MssBackend(_ScreenshotBackend):
 
 _backend_instances: dict[str, _ScreenshotBackend] = {}
 
+#: Backends that have handed back an unusable frame in this process.
+#: On VM/RDP desktops dxcam can initialize successfully and then return empty
+#: frames from then on (issue #371). Retrying it on every call just reproduces
+#: the same broken capture, so a backend caught doing this is skipped for the
+#: rest of the process and the chain moves on to mss.
+_degraded_backends: set[str] = set()
+
 
 def _get_backend(name: str) -> _ScreenshotBackend:
     """Return a cached singleton instance for the given backend *name*."""
@@ -228,6 +293,30 @@ def _get_backend(name: str) -> _ScreenshotBackend:
             raise ValueError(f"Unknown screenshot backend: {name!r}")
         _backend_instances[name] = cls()
     return _backend_instances[name]
+
+
+def _is_usable_capture(image: Image.Image | None) -> bool:
+    """Return True if a captured frame is structurally sound enough to encode.
+
+    A backend that fails by raising is already handled by the chain below. The
+    case this catches is the quiet one behind issue #371: on VM/RDP desktops
+    dxcam can initialize successfully and then return frames carrying no pixel
+    data, which travel all the way to the client as an undecodable image with no
+    error anywhere in between.
+
+    Only structure is checked, never content -- a legitimately black screen is a
+    perfectly valid screenshot, and rejecting it would break locked and
+    screensaver desktops.
+    """
+    if image is None:
+        return False
+    if image.width <= 0 or image.height <= 0:
+        return False
+    try:
+        image.load()
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -253,17 +342,34 @@ def capture(
 
     # Try each candidate: skip unavailable ones, catch failures and fall through.
     for backend_cls in chain:
+        if backend_cls.name in _degraded_backends:
+            continue
         inst = _get_backend(backend_cls.name)
         if not inst.is_available(capture_rect):
             continue
         try:
-            return inst.capture(capture_rect), inst.name
-        except (OSError, RuntimeError, ValueError):
+            image = inst.capture(capture_rect)
+        except (OSError, RuntimeError, ValueError, IndexError, COMError):
             logger.warning(
                 "Screenshot backend '%s' failed; trying next backend",
                 inst.name,
                 exc_info=selected != "auto",
             )
+            continue
+
+        # A backend can also fail silently, returning a frame with nothing in it.
+        # Treat that exactly like a raised failure rather than shipping bytes the
+        # client cannot decode.
+        if not _is_usable_capture(image):
+            _degraded_backends.add(inst.name)
+            logger.warning(
+                "Screenshot backend '%s' returned an unusable frame; disabling it "
+                "for this process and trying the next backend",
+                inst.name,
+            )
+            continue
+
+        return image, inst.name
 
     # All candidates exhausted — pillow is always present as the last resort.
     return _get_backend("pillow").capture(capture_rect), "pillow"
